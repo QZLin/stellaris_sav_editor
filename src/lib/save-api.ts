@@ -70,6 +70,7 @@ export interface UploadResponse {
   meta: SaveMeta;
   player_country_id: string;
   gamestate_size: number;
+  split_info?: Record<string, number>;
 }
 
 export interface ResourcesResponse {
