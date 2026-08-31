@@ -1,0 +1,722 @@
+     1→'use client';
+     2→
+     3→import { useState, useCallback, useEffect, useRef } from 'react';
+     4→import {
+     5→  Upload, FileText, Download, RotateCcw, Save,
+     6→  ChevronRight, Star, Globe, Users, Dna, Calendar,
+     7→  Zap, Gem, Wheat, FlaskConical, Cog, Crown, Sparkles,
+     8→  Monitor, Wrench, Wind, TestTubes, Diamond, Moon,
+     9→  Amphora, Orbit, Bot, AlertTriangle, Check, Loader2,
+    10→  Shield, Swords, Rocket, MapPin, BookOpen, Flag,
+    11→} from 'lucide-react';
+    12→import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+    13→import { Button } from '@/components/ui/button';
+    14→import { Input } from '@/components/ui/input';
+    15→import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+    16→import { Badge } from '@/components/ui/badge';
+    17→import { Separator } from '@/components/ui/separator';
+    18→import { ScrollArea } from '@/components/ui/scroll-area';
+    19→import { Label } from '@/components/ui/label';
+    20→import {
+    21→  Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger,
+    22→} from '@/components/ui/dialog';
+    23→import { useToast } from '@/hooks/use-toast';
+    24→import {
+    25→  type SaveMeta, type GameStats, type ResourceInfo,
+    26→  type CountryInfo, type SpeciesInfo, type ResourceCategory,
+    27→  uploadSave, getMeta, getStats, getResources, getCountries,
+    28→  getSpecies, updateResources, updateDate, updateName,
+    29→  exportSave, releaseSave,
+    30→} from '@/lib/save-api';
+    31→
+    32→// ============ ICON MAPPING ============
+    33→const RESOURCE_ICON_MAP: Record<string, React.ReactNode> = {
+    34→  energy: <Zap className="h-4 w-4 text-yellow-400" />,
+    35→  minerals: <Gem className="h-4 w-4 text-cyan-400" />,
+    36→  food: <Wheat className="h-4 w-4 text-green-400" />,
+    37→  physics_research: <FlaskConical className="h-4 w-4 text-blue-400" />,
+    38→  society_research: <Dna className="h-4 w-4 text-green-300" />,
+    39→  engineering_research: <Cog className="h-4 w-4 text-orange-400" />,
+    40→  influence: <Crown className="h-4 w-4 text-purple-400" />,
+    41→  unity: <Sparkles className="h-4 w-4 text-amber-400" />,
+    42→  consumer_goods: <Monitor className="h-4 w-4 text-gray-300" />,
+    43→  alloys: <Wrench className="h-4 w-4 text-slate-300" />,
+    44→  volatile_motes: <Wind className="h-4 w-4 text-orange-300" />,
+    45→  exotic_gases: <TestTubes className="h-4 w-4 text-teal-400" />,
+    46→  rare_crystals: <Diamond className="h-4 w-4 text-pink-400" />,
+    47→  sr_dark_matter: <Moon className="h-4 w-4 text-indigo-400" />,
+    48→  minor_artifacts: <Amphora className="h-4 w-4 text-amber-600" />,
+    49→  sr_zro: <Orbit className="h-4 w-4 text-violet-400" />,
+    50→  nanites: <Bot className="h-4 w-4 text-emerald-400" />,
+    51→};
+    52→
+    53→const CATEGORY_COLORS: Record<string, string> = {
+    54→  '基础资源': 'bg-yellow-500/10 text-yellow-300 border-yellow-500/20',
+    55→  '科研': 'bg-blue-500/10 text-blue-300 border-blue-500/20',
+    56→  '战略资源': 'bg-purple-500/10 text-purple-300 border-purple-500/20',
+    57→  '稀有资源': 'bg-orange-500/10 text-orange-300 border-orange-500/20',
+    58→  '高级资源': 'bg-pink-500/10 text-pink-300 border-pink-500/20',
+    59→};
+    60→
+    61→// ============ MAIN COMPONENT ============
+    62→export default function StellarisSaveEditor() {
+    63→  const { toast } = useToast();
+    64→  const fileInputRef = useRef<HTMLInputElement>(null);
+    65→
+    66→  // State
+    67→  const [loading, setLoading] = useState(false);
+    68→  const [loaded, setLoaded] = useState(false);
+    69→  const [meta, setMeta] = useState<SaveMeta | null>(null);
+    70→  const [stats, setStats] = useState<GameStats | null>(null);
+    71→  const [resources, setResources] = useState<Record<string, ResourceInfo>>({});
+    72→  const [resourceCategories, setResourceCategories] = useState<ResourceCategory>({});
+    73→  const [countries, setCountries] = useState<CountryInfo[]>([]);
+    74→  const [species, setSpecies] = useState<SpeciesInfo[]>([]);
+    75→  const [selectedCountry, setSelectedCountry] = useState('0');
+    76→  const [editName, setEditName] = useState('');
+    77→  const [editDate, setEditDate] = useState('');
+    78→  const [editResources, setEditResources] = useState<Record<string, string>>({});
+    79→  const [saving, setSaving] = useState(false);
+    80→  const [exporting, setExporting] = useState(false);
+    81→  const [activeTab, setActiveTab] = useState('overview');
+    82→
+    83→  // Load save file
+    84→  const handleFileUpload = useCallback(async (file: File) => {
+    85→    if (!file.name.endsWith('.sav')) {
+    86→      toast({ title: '错误', description: '请选择 .sav 格式的群星存档文件', variant: 'destructive' });
+    87→      return;
+    88→    }
+    89→    setLoading(true);
+    90→    try {
+    91→      const result = await uploadSave(file);
+    92→      setMeta(result.meta);
+    93→      setEditName(result.meta.name);
+    94→      setEditDate(result.meta.date);
+    95→      setSelectedCountry(result.player_country_id);
+    96→      setLoaded(true);
+    97→      setActiveTab('overview');
+    98→      toast({ title: '存档加载成功', description: `${result.meta.name} (${result.meta.date})` });
+    99→
+   100→      // Load additional data
+   101→      const [statsData, countriesData, resourcesData, speciesData] = await Promise.all([
+   102→        getStats(),
+   103→        getCountries(),
+   104→        getResources(result.player_country_id),
+   105→        getSpecies(),
+   106→      ]);
+   107→      setStats(statsData);
+   108→      setCountries(countriesData.countries);
+   109→      setResources(resourcesData.resources);
+   110→      setResourceCategories(resourcesData.categories);
+   111→      setSpecies(speciesData.species);
+   112→
+   113→      // Init edit resources
+   114→      const initEdit: Record<string, string> = {};
+   115→      for (const [k, v] of Object.entries(resourcesData.resources)) {
+   116→        initEdit[k] = v.value.toFixed(2);
+   117→      }
+   118→      setEditResources(initEdit);
+   119→    } catch (err) {
+   120→      toast({
+   121→        title: '加载失败',
+   122→        description: err instanceof Error ? err.message : '未知错误',
+   123→        variant: 'destructive',
+   124→      });
+   125→    } finally {
+   126→      setLoading(false);
+   127→    }
+   128→  }, [toast]);
+   129→
+   130→  // Handle drag & drop
+   131→  const [dragOver, setDragOver] = useState(false);
+   132→
+   133→  const handleDrop = useCallback((e: React.DragEvent) => {
+   134→    e.preventDefault();
+   135→    setDragOver(false);
+   136→    const file = e.dataTransfer.files[0];
+   137→    if (file) handleFileUpload(file);
+   138→  }, [handleFileUpload]);
+   139→
+   140→  // Save resources
+   141→  const handleSaveResources = async () => {
+   142→    setSaving(true);
+   143→    try {
+   144→      const parsed: Record<string, number> = {};
+   145→      for (const [k, v] of Object.entries(editResources)) {
+   146→        const num = parseFloat(v);
+   147→        if (!isNaN(num)) parsed[k] = num;
+   148→      }
+   149→      await updateResources(selectedCountry, parsed);
+   150→      // Refresh resources
+   151→      const data = await getResources(selectedCountry);
+   152→      setResources(data.resources);
+   153→      const initEdit: Record<string, string> = {};
+   154→      for (const [k, v] of Object.entries(data.resources)) {
+   155→        initEdit[k] = v.value.toFixed(2);
+   156→      }
+   157→      setEditResources(initEdit);
+   158→      toast({ title: '保存成功', description: '资源已更新' });
+   159→    } catch (err) {
+   160→      toast({ title: '保存失败', description: err instanceof Error ? err.message : '未知错误', variant: 'destructive' });
+   161→    } finally {
+   162→      setSaving(false);
+   163→    }
+   164→  };
+   165→
+   166→  // Save date
+   167→  const handleSaveDate = async () => {
+   168→    if (!/^\d{4}\.\d{2}\.\d{2}$/.test(editDate)) {
+   169→      toast({ title: '格式错误', description: '日期格式应为 YYYY.MM.DD', variant: 'destructive' });
+   170→      return;
+   171→    }
+   172→    setSaving(true);
+   173→    try {
+   174→      await updateDate(editDate);
+   175→      const newStats = await getStats();
+   176→      setStats(newStats);
+   177→      if (meta) setMeta({ ...meta, date: editDate });
+   178→      toast({ title: '日期已更新', description: editDate });
+   179→    } catch (err) {
+   180→      toast({ title: '更新失败', description: err instanceof Error ? err.message : '未知错误', variant: 'destructive' });
+   181→    } finally {
+   182→      setSaving(false);
+   183→    }
+   184→  };
+   185→
+   186→  // Save name
+   187→  const handleSaveName = async () => {
+   188→    if (!editName.trim()) {
+   189→      toast({ title: '名称不能为空', variant: 'destructive' });
+   190→      return;
+   191→    }
+   192→    setSaving(true);
+   193→    try {
+   194→      await updateName(editName.trim());
+   195→      if (meta) setMeta({ ...meta, name: editName.trim() });
+   196→      const newCountries = await getCountries();
+   197→      setCountries(newCountries.countries);
+   198→      toast({ title: '名称已更新', description: editName.trim() });
+   199→    } catch (err) {
+   200→      toast({ title: '更新失败', description: err instanceof Error ? err.message : '未知错误', variant: 'destructive' });
+   201→    } finally {
+   202→      setSaving(false);
+   203→    }
+   204→  };
+   205→
+   206→  // Export
+   207→  const handleExport = async () => {
+   208→    setExporting(true);
+   209→    try {
+   210→      const blob = await exportSave();
+   211→      const url = URL.createObjectURL(blob);
+   212→      const a = document.createElement('a');
+   213→      a.href = url;
+   214→      a.download = meta ? `${meta.name.replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, '_')}_modified.sav` : 'modified_save.sav';
+   215→      document.body.appendChild(a);
+   216→      a.click();
+   217→      document.body.removeChild(a);
+   218→      URL.revokeObjectURL(url);
+   219→      toast({ title: '导出成功', description: '修改后的存档已下载' });
+   220→    } catch (err) {
+   221→      toast({ title: '导出失败', description: err instanceof Error ? err.message : '未知错误', variant: 'destructive' });
+   222→    } finally {
+   223→      setExporting(false);
+   224→    }
+   225→  };
+   226→
+   227→  // Reset
+   228→  const handleReset = async () => {
+   229→    setLoaded(false);
+   230→    setMeta(null);
+   231→    setStats(null);
+   232→    setResources({});
+   233→    setCountries([]);
+   234→    setSpecies([]);
+   235→    setEditResources({});
+   236→    try { await releaseSave(); } catch { /* ignore */ }
+   237→    toast({ title: '存档已释放' });
+   238→  };
+   239→
+   240→  // Switch country
+   241→  const handleCountryChange = async (countryId: string) => {
+   242→    setSelectedCountry(countryId);
+   243→    try {
+   244→      const data = await getResources(countryId);
+   245→      setResources(data.resources);
+   246→      setResourceCategories(data.categories);
+   247→      const initEdit: Record<string, string> = {};
+   248→      for (const [k, v] of Object.entries(data.resources)) {
+   249→        initEdit[k] = v.value.toFixed(2);
+   250→      }
+   251→      setEditResources(initEdit);
+   252→    } catch (err) {
+   253→      toast({ title: '加载资源失败', description: err instanceof Error ? err.message : '', variant: 'destructive' });
+   254→    }
+   255→  };
+   256→
+   257→  // Quick set resource value
+   258→  const setResourceValue = (key: string, value: string) => {
+   259→    setEditResources(prev => ({ ...prev, [key]: value }));
+   260→  };
+   261→
+   262→  // ============ RENDER: UPLOAD SCREEN ============
+   263→  if (!loaded) {
+   264→    return (
+   265→      <div className="min-h-screen flex items-center justify-center p-4"
+   266→        style={{ background: 'radial-gradient(ellipse at 20% 50%, rgba(30,10,60,0.8) 0%, rgba(5,5,15,1) 70%)' }}
+   267→      >
+   268→        <div className="absolute inset-0 overflow-hidden pointer-events-none">
+   269→          {/* Stars background */}
+   270→          {Array.from({ length: 80 }).map((_, i) => (
+   271→            <div
+   272→              key={i}
+   273→              className="absolute rounded-full bg-white"
+   274→              style={{
+   275→                width: Math.random() * 2 + 1,
+   276→                height: Math.random() * 2 + 1,
+   277→                top: `${Math.random() * 100}%`,
+   278→                left: `${Math.random() * 100}%`,
+   279→                opacity: Math.random() * 0.7 + 0.3,
+   280→                animation: `twinkle ${2 + Math.random() * 3}s ease-in-out ${Math.random() * 2}s infinite`,
+   281→              }}
+   282→            />
+   283→          ))}
+   284→        </div>
+   285→
+   286→        <Card className="relative z-10 w-full max-w-lg border-amber-500/20 bg-black/60 backdrop-blur-xl"
+   287→          style={{ boxShadow: '0 0 80px rgba(245,158,11,0.1)' }}
+   288→        >
+   289→          <CardHeader className="text-center pb-2">
+   290→            <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-amber-500/10 border border-amber-500/30">
+   291→              <Star className="h-8 w-8 text-amber-400" />
+   292→            </div>
+   293→            <CardTitle className="text-2xl font-bold text-amber-100">
+   294→              群星存档修改器
+   295→            </CardTitle>
+   296→            <CardDescription className="text-amber-200/60 mt-1">
+   297→              Stellaris Save Editor  ·  支持 Caelum / 最新版本存档
+   298→            </CardDescription>
+   299→          </CardHeader>
+   300→          <CardContent>
+   301→            <div
+   302→              className={`border-2 border-dashed rounded-xl p-10 text-center transition-all cursor-pointer ${
+   303→                dragOver
+   304→                  ? 'border-amber-400 bg-amber-500/10'
+   305→                  : 'border-gray-600 hover:border-amber-500/50 hover:bg-white/5'
+   306→              }`}
+   307→              onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+   308→              onDragLeave={() => setDragOver(false)}
+   309→              onDrop={handleDrop}
+   310→              onClick={() => fileInputRef.current?.click()}
+   311→            >
+   312→              <input
+   313→                ref={fileInputRef}
+   314→                type="file" accept=".sav" className="hidden"
+   315→                onChange={(e) => {
+   316→                  const file = e.target.files?.[0];
+   317→                  if (file) handleFileUpload(file);
+   318→                }}
+   319→              />
+   320→              {loading ? (
+   321→                <div className="flex flex-col items-center gap-3">
+   322→                  <Loader2 className="h-10 w-10 text-amber-400 animate-spin" />
+   323→                  <p className="text-amber-200">正在解析存档，请稍候...</p>
+   324→                  <p className="text-xs text-amber-200/40">大型存档可能需要10-20秒</p>
+   325→                </div>
+   326→              ) : (
+   327→                <div className="flex flex-col items-center gap-3">
+   328→                  <Upload className="h-10 w-10 text-amber-400/60" />
+   329→                  <p className="text-amber-100 font-medium">拖拽 .sav 存档文件到此处</p>
+   330→                  <p className="text-sm text-amber-200/50">或点击选择文件</p>
+   331→                </div>
+   332→              )}
+   333→            </div>
+   334→            <div className="mt-4 flex items-center gap-2 text-xs text-amber-200/30 justify-center">
+   335→              <Shield className="h-3 w-3" />
+   336→              <span>所有解析均在本地完成，不会上传任何数据</span>
+   337→            </div>
+   338→          </CardContent>
+   339→        </Card>
+   340→      </div>
+   341→    );
+   342→  }
+   343→
+   344→  // ============ RENDER: EDITOR SCREEN ============
+   345→  return (
+   346→    <div className="min-h-screen flex flex-col"
+   347→      style={{ background: 'linear-gradient(135deg, rgba(5,5,20,1) 0%, rgba(15,10,30,1) 50%, rgba(5,10,25,1) 100%)' }}
+   348→    >
+   349→      {/* Header */}
+   350→      <header className="sticky top-0 z-50 border-b border-amber-500/10 bg-black/70 backdrop-blur-xl">
+   351→        <div className="max-w-7xl mx-auto px-4 h-14 flex items-center justify-between">
+   352→          <div className="flex items-center gap-3">
+   353→            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-amber-500/15">
+   354→              <Star className="h-4 w-4 text-amber-400" />
+   355→            </div>
+   356→            <div>
+   357→              <h1 className="text-sm font-bold text-amber-100 leading-tight">{meta?.name || '群星存档修改器'}</h1>
+   358→              <p className="text-xs text-amber-200/40">{meta?.version}  ·  {meta?.date}</p>
+   359→            </div>
+   360→            {meta?.ironman && (
+   361→              <Badge variant="outline" className="border-red-500/40 text-red-400 text-xs">
+   362→                铁人模式
+   363→              </Badge>
+   364→            )}
+   365→          </div>
+   366→          <div className="flex items-center gap-2">
+   367→            <Button variant="outline" size="sm" onClick={handleReset}
+   368→              className="border-gray-600 text-gray-300 hover:text-white hover:bg-white/5">
+   369→              <RotateCcw className="h-3.5 w-3.5 mr-1" /> 释放存档
+   370→            </Button>
+   371→            <Button size="sm" onClick={handleExport} disabled={exporting}
+   372→              className="bg-amber-500 hover:bg-amber-400 text-black font-medium">
+   373→              {exporting ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" /> : <Download className="h-3.5 w-3.5 mr-1" />}
+   374→              导出存档
+   375→            </Button>
+   376→          </div>
+   377→        </div>
+   378→      </header>
+   379→
+   380→      {/* Main Content */}
+   381→      <main className="flex-1 max-w-7xl mx-auto w-full px-4 py-6">
+   382→        <Tabs value={activeTab} onValueChange={setActiveTab}>
+   383→          <TabsList className="bg-black/40 border border-amber-500/10 mb-6">
+   384→            <TabsTrigger value="overview" className="data-[state=active]:bg-amber-500/20 data-[state=active]:text-amber-100">
+   385→              <Globe className="h-3.5 w-3.5 mr-1.5" /> 总览
+   386→            </TabsTrigger>
+   387→            <TabsTrigger value="resources" className="data-[state=active]:bg-amber-500/20 data-[state=active]:text-amber-100">
+   388→              <Zap className="h-3.5 w-3.5 mr-1.5" /> 资源
+   389→            </TabsTrigger>
+   390→            <TabsTrigger value="countries" className="data-[state=active]:bg-amber-500/20 data-[state=active]:text-amber-100">
+   391→              <Flag className="h-3.5 w-3.5 mr-1.5" /> 国家
+   392→            </TabsTrigger>
+   393→            <TabsTrigger value="species" className="data-[state=active]:bg-amber-500/20 data-[state=active]:text-amber-100">
+   394→              <Dna className="h-3.5 w-3.5 mr-1.5" /> 物种
+   395→            </TabsTrigger>
+   396→          </TabsList>
+   397→
+   398→          {/* ===== OVERVIEW TAB ===== */}
+   399→          <TabsContent value="overview" className="space-y-6">
+   400→            {/* Empire Info Card */}
+   401→            <Card className="border-amber-500/10 bg-black/40 backdrop-blur">
+   402→              <CardHeader className="pb-3">
+   403→                <CardTitle className="text-amber-100 text-base flex items-center gap-2">
+   404→                  <Star className="h-4 w-4" /> 帝国信息
+   405→                </CardTitle>
+   406→              </CardHeader>
+   407→              <CardContent>
+   408→                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+   409→                  {/* Name edit */}
+   410→                  <div className="space-y-2">
+   411→                    <Label className="text-amber-200/70 text-xs">帝国名称</Label>
+   412→                    <div className="flex gap-2">
+   413→                      <Input value={editName} onChange={e => setEditName(e.target.value)}
+   414→                        className="bg-white/5 border-gray-600 text-amber-50" />
+   415→                      <Button size="sm" onClick={handleSaveName} disabled={saving}
+   416→                        className="bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/30 shrink-0">
+   417→                        <Save className="h-3.5 w-3.5" />
+   418→                      </Button>
+   419→                    </div>
+   420→                  </div>
+   421→                  {/* Date edit */}
+   422→                  <div className="space-y-2">
+   423→                    <Label className="text-amber-200/70 text-xs">游戏日期</Label>
+   424→                    <div className="flex gap-2">
+   425→                      <Input value={editDate} onChange={e => setEditDate(e.target.value)}
+   426→                        placeholder="YYYY.MM.DD" className="bg-white/5 border-gray-600 text-amber-50" />
+   427→                      <Button size="sm" onClick={handleSaveDate} disabled={saving}
+   428→                        className="bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/30 shrink-0">
+   429→                        <Save className="h-3.5 w-3.5" />
+   430→                      </Button>
+   431→                    </div>
+   432→                  </div>
+   433→                </div>
+   434→              </CardContent>
+   435→            </Card>
+   436→
+   437→            {/* Stats Grid */}
+   438→            {stats && (
+   439→              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+   440→                {[
+   441→                  { label: '游戏日期', value: stats.date, icon: <Calendar className="h-4 w-4 text-blue-400" /> },
+   442→                  { label: '帝国规模', value: stats.empire_size, icon: <MapPin className="h-4 w-4 text-green-400" /> },
+   443→                  { label: '科技数量', value: stats.tech_count, icon: <BookOpen className="h-4 w-4 text-purple-400" /> },
+   444→                  { label: '舰队规模', value: stats.fleet_size, icon: <Rocket className="h-4 w-4 text-red-400" /> },
+   445→                  { label: '军事力量', value: Math.round(stats.military_power).toLocaleString(), icon: <Swords className="h-4 w-4 text-orange-400" /> },
+   446→                  { label: '国家数量', value: stats.num_countries, icon: <Flag className="h-4 w-4 text-cyan-400" /> },
+   447→                  { label: '物种数量', value: stats.num_species, icon: <Dna className="h-4 w-4 text-green-300" /> },
+   448→                  { label: '行星数量', value: stats.owned_planets_count, icon: <Globe className="h-4 w-4 text-amber-400" /> },
+   449→                ].map(stat => (
+   450→                  <Card key={stat.label} className="border-gray-700/50 bg-black/30">
+   451→                    <CardContent className="p-4 flex items-center gap-3">
+   452→                      <div className="p-2 rounded-lg bg-white/5">{stat.icon}</div>
+   453→                      <div>
+   454→                        <p className="text-xs text-gray-400">{stat.label}</p>
+   455→                        <p className="text-lg font-bold text-amber-100">{stat.value}</p>
+   456→                      </div>
+   457→                    </CardContent>
+   458→                  </Card>
+   459→                ))}
+   460→              </div>
+   461→            )}
+   462→
+   463→            {/* DLCs */}
+   464→            {meta?.dlcs && meta.dlcs.length > 0 && (
+   465→              <Card className="border-gray-700/50 bg-black/30">
+   466→                <CardHeader className="pb-3">
+   467→                  <CardTitle className="text-amber-100 text-base flex items-center gap-2">
+   468→                    <FileText className="h-4 w-4" /> 已启用DLC ({meta.dlcs.length})
+   469→                  </CardTitle>
+   470→                </CardHeader>
+   471→                <CardContent>
+   472→                  <div className="flex flex-wrap gap-2">
+   473→                    {meta.dlcs.map((dlc, i) => (
+   474→                      <Badge key={i} variant="outline" className="border-gray-600 text-gray-300 text-xs">
+   475→                        {dlc.replace(/ Story Pack$| Species Pack$/i, '').replace(/^(The )/i, '')}
+   476→                      </Badge>
+   477→                    ))}
+   478→                  </div>
+   479→                </CardContent>
+   480→              </Card>
+   481→            )}
+   482→          </TabsContent>
+   483→
+   484→          {/* ===== RESOURCES TAB ===== */}
+   485→          <TabsContent value="resources" className="space-y-6">
+   486→            {/* Country selector */}
+   487→            <Card className="border-amber-500/10 bg-black/40">
+   488→              <CardContent className="p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+   489→                <div className="flex items-center gap-3">
+   490→                  <Label className="text-amber-200/70 text-sm">选择国家:</Label>
+   491→                  <select
+   492→                    value={selectedCountry}
+   493→                    onChange={e => handleCountryChange(e.target.value)}
+   494→                    className="bg-white/5 border border-gray-600 text-amber-50 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-amber-500/50"
+   495→                  >
+   496→                    {countries.filter(c => c.name).map(c => (
+   497→                      <option key={c.id} value={c.id} className="bg-gray-900">
+   498→                        {c.name} (ID: {c.id})
+   499→                      </option>
+   500→                    ))}
+   501→                  </select>
+   502→                </div>
+   503→                <Button onClick={handleSaveResources} disabled={saving}
+   504→                  className="bg-amber-500 hover:bg-amber-400 text-black font-medium">
+   505→                  {saving ? <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" /> : <Save className="h-3.5 w-3.5 mr-1.5" />}
+   506→                  保存所有资源
+   507→                </Button>
+   508→              </CardContent>
+   509→            </Card>
+   510→
+   511→            {/* Resource categories */}
+   512→            {Object.entries(resourceCategories).map(([category, keys]) => {
+   513→              const filteredKeys = keys.filter(k => resources[k]);
+   514→              if (filteredKeys.length === 0) return null;
+   515→              return (
+   516→                <Card key={category} className="border-gray-700/50 bg-black/30">
+   517→                  <CardHeader className="pb-3">
+   518→                    <div className="flex items-center justify-between">
+   519→                      <CardTitle className="text-amber-100 text-sm flex items-center gap-2">
+   520→                        {category}
+   521→                      </CardTitle>
+   522→                      <Badge className={`text-xs border ${CATEGORY_COLORS[category] || ''}`}>
+   523→                        {filteredKeys.length} 项
+   524→                      </Badge>
+   525→                    </div>
+   526→                  </CardHeader>
+   527→                  <CardContent>
+   528→                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+   529→                      {filteredKeys.map(key => {
+   530→                        const res = resources[key];
+   531→                        if (!res) return null;
+   532→                        const hasChanged = editResources[key] &&
+   533→                          Math.abs(parseFloat(editResources[key]) - res.value) > 0.001;
+   534→                        return (
+   535→                          <div key={key} className={`
+   536→                            flex items-center gap-3 p-3 rounded-lg border transition-colors
+   537→                            ${hasChanged
+   538→                              ? 'bg-amber-500/10 border-amber-500/30'
+   539→                              : 'bg-white/[0.02] border-gray-700/30 hover:border-gray-600/50'
+   540→                            }
+   541→                          `>
+   542→                            <div className="shrink-0">
+   543→                              {RESOURCE_ICON_MAP[key] || <Zap className="h-4 w-4 text-gray-400" />}
+   544→                            </div>
+   545→                            <div className="flex-1 min-w-0">
+   546→                              <p className="text-xs text-gray-400 truncate">{res.label}</p>
+   547→                              <Input
+   548→                                type="number"
+   549→                                step="0.01"
+   550→                                value={editResources[key] || ''}
+   551→                                onChange={e => setResourceValue(key, e.target.value)}
+   552→                                className="h-7 text-sm bg-transparent border-gray-600/50 text-amber-50 mt-0.5"
+   553→                              />
+   554→                            </div>
+   555→                            {hasChanged && (
+   556→                              <div className="text-right shrink-0">
+   557→                                <p className="text-[10px] text-gray-500">原值</p>
+   558→                                <p className="text-xs text-gray-400">{res.value.toFixed(1)}</p>
+   559→                              </div>
+   560→                            )}
+   561→                            {res.income > 0 && (
+   562→                              <div className="text-right shrink-0">
+   563→                                <p className="text-[10px] text-gray-500">月入</p>
+   564→                                <p className="text-xs text-green-400">+{res.income.toFixed(1)}</p>
+   565→                              </div>
+   566→                            )}
+   567→                          </div>
+   568→                        );
+   569→                      })}
+   570→                    </div>
+   571→                  </CardContent>
+   572→                </Card>
+   573→              );
+   574→            })}
+   575→
+   576→            {/* Quick actions */}
+   577→            <Card className="border-amber-500/10 bg-black/40">
+   578→              <CardHeader className="pb-3">
+   579→                <CardTitle className="text-amber-100 text-sm">快速操作</CardTitle>
+   580→              </CardHeader>
+   581→              <CardContent>
+   582→                <div className="flex flex-wrap gap-2">
+   583→                  {[
+   584→                    { label: '全部设为 99999', multiplier: 99999 },
+   585→                    { label: '全部设为 50000', multiplier: 50000 },
+   586→                    { label: '全部设为 10000', multiplier: 10000 },
+   587→                    { label: '全部翻倍', multiplier: -2 },
+   588→                    { label: '全部清零', multiplier: 0 },
+   589→                  ].map(action => (
+   590→                    <Button key={action.label} variant="outline" size="sm"
+   591→                      className="border-gray-600 text-gray-300 hover:text-amber-200 hover:border-amber-500/30"
+   592→                      onClick={() => {
+   593→                        const newRes: Record<string, string> = {};
+   594→                        for (const k of Object.keys(editResources)) {
+   595→                          if (action.multiplier === -2) {
+   596→                            newRes[k] = (parseFloat(editResources[k] || '0') * 2).toFixed(2);
+   597→                          } else {
+   598→                            newRes[k] = action.multiplier.toFixed(2);
+   599→                          }
+   600→                        }
+   601→                        setEditResources(newRes);
+   602→                      }}
+   603→                    >
+   604→                      {action.label}
+   605→                    </Button>
+   606→                  ))}
+   607→                </div>
+   608→              </CardContent>
+   609→            </Card>
+   610→          </TabsContent>
+   611→
+   612→          {/* ===== COUNTRIES TAB ===== */}
+   613→          <TabsContent value="countries">
+   614→            <Card className="border-gray-700/50 bg-black/30">
+   615→              <CardHeader className="pb-3">
+   616→                <CardTitle className="text-amber-100 text-base flex items-center gap-2">
+   617→                  <Flag className="h-4 w-4" /> 所有国家 ({countries.length})
+   618→                </CardTitle>
+   619→              </CardHeader>
+   620→              <CardContent>
+   621→                <ScrollArea className="max-h-[600px]">
+   622→                  <div className="space-y-2">
+   623→                    {countries.filter(c => c.name).sort((a, b) => {
+   624→                      if (a.id === stats?.player_country_id) return -1;
+   625→                      if (b.id === stats?.player_country_id) return 1;
+   626→                      return 0;
+   627→                    }).map(country => (
+   628→                      <div key={country.id}
+   629→                        className={`flex items-center justify-between p-3 rounded-lg border transition-colors cursor-pointer
+   630→                          ${country.id === selectedCountry
+   631→                            ? 'bg-amber-500/10 border-amber-500/30'
+   632→                            : 'bg-white/[0.02] border-gray-700/30 hover:border-gray-600/50'
+   633→                          }
+   634→                        `}
+   635→                        onClick={() => {
+   636→                          handleCountryChange(country.id);
+   637→                          setActiveTab('resources');
+   638→                        }}
+   639→                      >
+   640→                        <div className="flex items-center gap-3">
+   641→                          {country.id === stats?.player_country_id && (
+   642→                            <Badge className="bg-amber-500/20 text-amber-300 border-amber-500/30 text-xs">
+   643→                              玩家
+   644→                            </Badge>
+   645→                          )}
+   646→                          <div>
+   647→                            <p className="text-sm text-amber-50 font-medium">{country.name}</p>
+   648→                            <p className="text-xs text-gray-500">ID: {country.id}  ·  {country.type}</p>
+   649→                          </div>
+   650→                        </div>
+   651→                        <div className="flex items-center gap-4 text-xs text-gray-400">
+   652→                          <span className="flex items-center gap-1">
+   653→                            <Swords className="h-3 w-3" /> {Math.round(country.military_power).toLocaleString()}
+   654→                          </span>
+   655→                          <span className="flex items-center gap-1">
+   656→                            <Rocket className="h-3 w-3" /> {country.fleet_size}
+   657→                          </span>
+   658→                          <ChevronRight className="h-4 w-4" />
+   659→                        </div>
+   660→                      </div>
+   661→                    ))}
+   662→                  </div>
+   663→                </ScrollArea>
+   664→              </CardContent>
+   665→            </Card>
+   666→          </TabsContent>
+   667→
+   668→          {/* ===== SPECIES TAB ===== */}
+   669→          <TabsContent value="species">
+   670→            <Card className="border-gray-700/50 bg-black/30">
+   671→              <CardHeader className="pb-3">
+   672→                <CardTitle className="text-amber-100 text-base flex items-center gap-2">
+   673→                  <Dna className="h-4 w-4" /> 物种列表
+   674→                  {stats && <Badge className="bg-amber-500/20 text-amber-300 border-amber-500/30 text-xs">共 {stats.num_species} 个</Badge>}
+   675→                </CardTitle>
+   676→              </CardHeader>
+   677→              <CardContent>
+   678→                <ScrollArea className="max-h-[600px]">
+   679→                  <div className="space-y-2">
+   680→                    {species.filter(s => s.name && s.name !== '(未命名)').map(sp => (
+   681→                      <div key={sp.id} className="flex items-center justify-between p-3 rounded-lg border bg-white/[0.02] border-gray-700/30">
+   682→                        <div className="flex items-center gap-3">
+   683→                          <div className="h-8 w-8 rounded-full bg-gradient-to-br from-purple-500/30 to-cyan-500/30 border border-gray-600/50 flex items-center justify-center text-xs text-gray-400">
+   684→                            {sp.class}
+   685→                          </div>
+   686→                          <div>
+   687→                            <p className="text-sm text-amber-50 font-medium">{sp.name}</p>
+   688→                            <p className="text-xs text-gray-500">{sp.portrait}  ·  ID: {sp.id}</p>
+   689→                          </div>
+   690→                        </div>
+   691→                        <div className="flex flex-wrap gap-1 max-w-xs justify-end">
+   692→                          {sp.traits.slice(0, 4).map((trait, i) => (
+   693→                            <Badge key={i} variant="outline" className="border-gray-600 text-gray-400 text-[10px]">
+   694→                              {trait.replace('trait_', '').replace(/_/g, ' ')}
+   695→                            </Badge>
+   696→                          ))}
+   697→                          {sp.traits.length > 4 && (
+   698→                            <Badge variant="outline" className="border-gray-600 text-gray-500 text-[10px]">
+   699→                              +{sp.traits.length - 4}
+   700→                            </Badge>
+   701→                          )}
+   702→                        </div>
+   703→                      </div>
+   704→                    ))}
+   705→                  </div>
+   706→                </ScrollArea>
+   707→              </CardContent>
+   708→            </Card>
+   709→          </TabsContent>
+   710→        </Tabs>
+   711→      </main>
+   712→
+   713→      {/* Footer */}
+   714→      <footer className="border-t border-gray-800/50 mt-auto">
+   715→        <div className="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between text-xs text-gray-500">
+   716→          <span>Stellaris Save Editor  ·  Paradox Clausewitz Engine</span>
+   717→          <span>支持版本: 3.x+ (含 Caelum)</span>
+   718→        </div>
+   719→      </footer>
+   720→    </div>
+   721→  );
+   722→}

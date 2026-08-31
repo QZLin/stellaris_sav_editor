@@ -1,0 +1,734 @@
+     1→"""
+     2→Stellaris Save File Parser - HTTP Service
+     3→Provides REST API for parsing, viewing, and modifying Stellaris .sav files.
+     4→"""
+     5→
+     6→import os
+     7→import sys
+     8→import json
+     9→import zipfile
+    10→import tempfile
+    11→import re
+    12→from http.server import HTTPServer, BaseHTTPRequestHandler
+    13→from urllib.parse import urlparse, parse_qs
+    14→import traceback
+    15→
+    16→from clausewitz_parser import parse_clausewitz
+    17→
+    18→
+    19→# In-memory save data store
+    20→save_state = {
+    21→    'sav_path': None,
+    22→    'meta_text': None,
+    23→    'gamestate_text': None,
+    24→    'meta_parsed': None,
+    25→    'gamestate_parsed': None,
+    26→}
+    27→
+    28→
+    29→RESOURCE_KEYS = [
+    30→    'energy', 'minerals', 'food', 'physics_research', 'society_research',
+    31→    'engineering_research', 'influence', 'unity', 'consumer_goods', 'alloys',
+    32→    'volatile_motes', 'exotic_gases', 'rare_crystals', 'sr_dark_matter', 'minor_artifacts',
+    33→    'sr_zro', 'nanites',
+    34→]
+    35→
+    36→RESOURCE_LABELS = {
+    37→    'energy': '能量币',
+    38→    'minerals': '矿物',
+    39→    'food': '食物',
+    40→    'physics_research': '物理学研究',
+    41→    'society_research': '社会学研究',
+    42→    'engineering_research': '工程学研究',
+    43→    'influence': '影响力',
+    44→    'unity': '凝聚力',
+    45→    'consumer_goods': '消费品',
+    46→    'alloys': '合金',
+    47→    'volatile_motes': '易爆微粒',
+    48→    'exotic_gases': '异星气体',
+    49→    'rare_crystals': '稀有水晶',
+    50→    'sr_dark_matter': '暗物质',
+    51→    'minor_artifacts': '小型遗物',
+    52→    'sr_zro': 'ZRO气体',
+    53→    'nanites': '纳米机器人',
+    54→}
+    55→
+    56→RESOURCE_ICONS = {
+    57→    'energy': '⚡', 'minerals': '💎', 'food': '🌾',
+    58→    'physics_research': '🔬', 'society_research': '🧬', 'engineering_research': '⚙️',
+    59→    'influence': '👑', 'unity': '✨', 'consumer_goods': '📺', 'alloys': '🔩',
+    60→    'volatile_motes': '💨', 'exotic_gases': '🧪', 'rare_crystals': '💠',
+    61→    'sr_dark_matter': '🌑', 'minor_artifacts': '🏺',
+    62→    'sr_zro': '🔮', 'nanites': '🤖',
+    63→}
+    64→
+    65→
+    66→RESOURCE_CATEGORIES = {
+    67→    '基础资源': ['energy', 'minerals', 'food'],
+    68→    '科研': ['physics_research', 'society_research', 'engineering_research'],
+    69→    '战略资源': ['influence', 'unity', 'consumer_goods', 'alloys'],
+    70→    '稀有资源': ['volatile_motes', 'exotic_gases', 'rare_crystals'],
+    71→    '高级资源': ['sr_dark_matter', 'sr_zro', 'nanites', 'minor_artifacts'],
+    72→}
+    73→
+    74→
+    75→def extract_save(filepath: str):
+    76→    """Extract .sav (ZIP) and read meta + gamestate texts."""
+    77→    with zipfile.ZipFile(filepath, 'r') as z:
+    78→        names = z.namelist()
+    79→        meta_text = z.read('meta').decode('utf-8') if 'meta' in names else ''
+    80→        gamestate_text = z.read('gamestate').decode('utf-8') if 'gamestate' in names else ''
+    81→    return meta_text, gamestate_text
+    82→
+    83→
+    84→def find_player_country_id(gamestate: dict) -> int:
+    85→    """Find the player's country index."""
+    86→    player = gamestate.get('player')
+    87→    if not player:
+    88→        return 0
+    89→    if isinstance(player, dict):
+    90→        items = player.get(None, [])
+    91→        if items and isinstance(items, list) and len(items) > 0:
+    92→            first = items[0]
+    93→            if isinstance(first, dict) and 'country' in first:
+    94→                return int(first['country'])
+    95→    return 0
+    96→
+    97→
+    98→def get_country_resources(gamestate: dict, country_idx: int) -> dict:
+    99→    """Extract resources for a specific country from modules.standard_economy_module."""
+   100→    countries = gamestate.get('country', {})
+   101→    c_key = str(country_idx)
+   102→    if c_key not in countries:
+   103→        return {}
+   104→    country = countries[c_key]
+   105→    if not isinstance(country, dict):
+   106→        return {}
+   107→    modules = country.get('modules', {})
+   108→    if not isinstance(modules, dict):
+   109→        return {}
+   110→    econ = modules.get('standard_economy_module', {})
+   111→    if not isinstance(econ, dict):
+   112→        return {}
+   113→    resources = econ.get('resources', {})
+   114→    return resources if isinstance(resources, dict) else {}
+   115→
+   116→
+   117→def get_countries_list(gamestate: dict) -> list:
+   118→    """Get list of all countries with basic info."""
+   119→    countries = gamestate.get('country', {})
+   120→    if not countries or not isinstance(countries, dict):
+   121→        return []
+   122→    result = []
+   123→    for idx, country in countries.items():
+   124→        if not isinstance(country, dict):
+   125→            continue
+   126→        name_data = country.get('name', '')
+   127→        if isinstance(name_data, dict):
+   128→            name_data = name_data.get('key', '')
+   129→        gov_type = country.get('type', '')
+   130→        is_player = False
+   131→        result.append({
+   132→            'id': str(idx),
+   133→            'name': str(name_data),
+   134→            'type': str(gov_type),
+   135→            'custom_name': bool(country.get('custom_name', False)),
+   136→            'capital': country.get('capital', ''),
+   137→            'military_power': float(country.get('military_power', 0)),
+   138→            'economy_power': float(country.get('economy_power', 0)),
+   139→            'tech_power': float(country.get('tech_power', 0)),
+   140→            'fleet_size': country.get('fleet_size', 0),
+   141→        })
+   142→    return result
+   143→
+   144→
+   145→def get_species_list(gamestate: dict, limit: int = 50) -> list:
+   146→    """Get list of species with traits."""
+   147→    species_db = gamestate.get('species_db', {})
+   148→    if not species_db or not isinstance(species_db, dict):
+   149→        return []
+   150→    result = []
+   151→    for idx, species in species_db.items():
+   152→        if not isinstance(species, dict):
+   153→            continue
+   154→        name_data = species.get('name', '')
+   155→        if isinstance(name_data, dict):
+   156→            name_data = name_data.get('key', '')
+   157→        traits = species.get('traits', [])
+   158→        if isinstance(traits, dict):
+   159→            traits = traits.get('trait', [])
+   160→        if not isinstance(traits, list):
+   161→            traits = [traits] if traits else []
+   162→        result.append({
+   163→            'id': str(idx),
+   164→            'name': str(name_data) if name_data else '(未命名)',
+   165→            'class': species.get('class', ''),
+   166→            'portrait': species.get('portrait', ''),
+   167→            'traits': [str(t) for t in traits if t],
+   168→            'home_planet': species.get('home_planet', ''),
+   169→        })
+   170→        if len(result) >= limit:
+   171→            break
+   172→    return result
+   173→
+   174→
+   175→def get_budget_info(gamestate: dict, country_idx: int) -> dict:
+   176→    """Get budget/income info for a country."""
+   177→    countries = gamestate.get('country', {})
+   178→    c_key = str(country_idx)
+   179→    if c_key not in countries:
+   180→        return {}
+   181→    country = countries[c_key]
+   182→    if not isinstance(country, dict):
+   183→        return {}
+   184→    budget = country.get('budget', {})
+   185→    if not isinstance(budget, dict):
+   186→        return {}
+   187→    current = budget.get('current_month', {})
+   188→    if not isinstance(current, dict):
+   189→        return {}
+   190→    income = current.get('income', {})
+   191→    if not isinstance(income, dict):
+   192→        return {}
+   193→    result = {}
+   194→    for source_name, source_data in income.items():
+   195→        if not isinstance(source_data, dict):
+   196→            continue
+   197→        for res_key, val in source_data.items():
+   198→            if res_key not in result:
+   199→                result[res_key] = 0.0
+   200→            try:
+   201→                result[res_key] += float(val)
+   202→            except (ValueError, TypeError):
+   203→                pass
+   204→    return result
+   205→
+   206→
+   207→def get_tech_count(gamestate: dict, country_idx: int) -> int:
+   208→    """Get number of researched technologies."""
+   209→    countries = gamestate.get('country', {})
+   210→    c_key = str(country_idx)
+   211→    if c_key not in countries:
+   212→        return 0
+   213→    country = countries[c_key]
+   214→    if not isinstance(country, dict):
+   215→        return 0
+   216→    tech_status = country.get('tech_status', {})
+   217→    if not isinstance(tech_status, dict):
+   218→        return 0
+   219→    techs = tech_status.get('technology', [])
+   220→    if isinstance(techs, list):
+   221→        return len(techs)
+   222→    return 0
+   223→
+   224→
+   225→# ============ TEXT MODIFICATION FUNCTIONS ============
+   226→
+   227→
+   228→def _find_block_by_path(text_lines: list, path_steps: list) -> tuple:
+   229→    """
+   230→    Navigate through nested blocks to find the target block.
+   231→    Returns (start_line_idx, end_line_idx, indent_level) or (-1,-1,-1) if not found.
+   232→    """
+   233→    depth = 0
+   234→    step_idx = 0
+   235→    current_step = path_steps[0]
+   236→    block_start = -1
+   237→
+   238→    for i, line in enumerate(text_lines):
+   239→        stripped = line.strip()
+   240→
+   241→        # Track depth via braces
+   242→        for ch in stripped:
+   243→            if ch == '{':
+   244→                depth += 1
+   245→            elif ch == '}':
+   246→                depth -= 1
+   247→
+   248→        if step_idx < len(path_steps):
+   249→ # Check if this line matches the current step
+   250→            pattern = re.compile(rf'^\s*{re.escape(str(current_step))}\s*[=\{{]')
+   251→            if pattern.match(line):
+   252→                if step_idx == 0:
+   253→                    block_start = i
+   254→                step_idx += 1
+   255→                if step_idx < len(path_steps):
+   256→                    current_step = path_steps[step_idx]
+   257→                else:
+   258→                    # Found the target block
+   259→                    # Return the block content range (after the opening brace)
+   260→                    return (block_start, i, depth)
+   261→
+   262→    return (-1, -1, -1)
+   263→
+   264→
+   265→def modify_resource_in_text(text: str, country_idx: int, resource_key: str, new_value: float) -> str:
+   266→    """Modify a single resource value directly in the raw gamestate text."""
+   267→    lines = text.split('\n')
+   268→
+   269→    # State machine to navigate: country={ 0={ ... modules={ standard_economy_module={ resources={ resource_key=VALUE } } } } }
+   270→    state = 'seeking_country'
+   271→    country_depth = 0
+   272→    country_idx_found = False
+   273→    module_depth = 0
+   274→    econ_found = False
+   275→    resource_block_depth = 0
+   276→    in_resource_block = False
+   277→    result_lines = []
+   278→    modified = False
+   279→
+   280→    for line in lines:
+   281→        if modified:
+   282→            result_lines.append(line)
+   283→            continue
+   284→
+   285→        stripped = line.strip()
+   286→
+   287→        # Count braces on this line
+   288→        opens = stripped.count('{')
+   289→        closes = stripped.count('}')
+   290→
+   291→        if state == 'seeking_country':
+   292→            if stripped == 'country={':
+   293→                state = 'in_country'
+   294→                country_depth = 1
+   295→            result_lines.append(line)
+   296→            continue
+   297→
+   298→        if state == 'in_country':
+   299→            country_depth += opens - closes
+   300→
+   301→            if country_depth <= 0:
+   302→                state = 'seeking_country'
+   303→                result_lines.append(line)
+   304→                continue
+   305→
+   306→            if not country_idx_found:
+   307→                # Look for the specific country index
+   308→                idx_pat = re.compile(r'^\s*' + re.escape(str(country_idx)) + r'=\{\s*$')
+   309→                if idx_pat.match(line):
+   310→                    country_idx_found = True
+   311→                    result_lines.append(line)
+   312→                    continue
+   313→
+   314→            if country_idx_found and not econ_found:
+   315→                # Look for standard_economy_module
+   316→                if re.match(r'^\s*standard_economy_module\s*={\s*$', line):
+   317→                    econ_found = True
+   318→                    result_lines.append(line)
+   319→                    continue
+   320→
+   321→            if econ_found and not in_resource_block:
+   322→                if re.match(r'^\s*resources\s*={\s*$', line):
+   323→                    in_resource_block = True
+   324→                    resource_block_depth = 1
+   325→                    result_lines.append(line)
+   326→                    continue
+   327→
+   328→            if in_resource_block:
+   329→                resource_block_depth += opens - closes
+   330→
+   331→                if resource_block_depth <= 0:
+   332→                    in_resource_block = False
+   333→                    result_lines.append(line)
+   334→                    continue
+   335→
+   336→                # Check for the resource key
+   337→                match = re.match(rf'^(\s*){re.escape(resource_key)}=(.+)$', line)
+   338→                if match:
+   339→                    indent = match.group(1)
+   340→                    formatted = f'{new_value:.5f}'.rstrip('0')
+   341→                    if formatted.endswith('.'):
+   342→                        formatted += '0'
+   343→                    result_lines.append(f'{indent}{resource_key}={formatted}')
+   344→                    modified = True
+   345→                    continue
+   346→
+   347→            result_lines.append(line)
+   348→            continue
+   349→
+   350→        result_lines.append(line)
+   351→
+   352→    return '\n'.join(result_lines)
+   353→
+   354→
+   355→def modify_date_in_text(text: str, new_date: str) -> str:
+   356→    """Modify the game date in text."""
+   357→    pattern = re.compile(r'^(date=")\d{4}\.\d{2}\.\d{2}(")', re.MULTILINE)
+   358→    return pattern.sub(f'\\g<1>{new_date}\\g<2>', text, count=1)
+   359→
+   360→
+   361→def modify_name_in_text(text: str, old_name: str, new_name: str) -> str:
+   362→    """Modify the empire name in gamestate text."""
+   363→    # In gamestate, the name is in the first country's name block
+   364→    # Format: name={\n\tkey="OLDNAME"\n}
+   365→    pattern = re.compile(r'^(name=\{\n\s*key=")' + re.escape(old_name) + r'(")', re.MULTILINE)
+   366→    result = pattern.sub(f'\\g<1>{new_name}\\g<2>', text, count=1)
+   367→    return result
+   368→
+   369→
+   370→def modify_name_in_meta(text: str, new_name: str) -> str:
+   371→    """Modify the empire name in meta text."""
+   372→    pattern = re.compile(r'^(name=")' + r'[^"]*' + r'(")', re.MULTILINE)
+   373→    return pattern.sub(f'\\g<1>{new_name}\\g<2>', text, count=1)
+   374→
+   375→
+   376→class SaveHandler(BaseHTTPRequestHandler):
+   377→    """HTTP request handler for save file operations."""
+   378→
+   379→    def _send_json(self, data: dict, status: int = 200):
+   380→        body = json.dumps(data, ensure_ascii=False).encode('utf-8')
+   381→        self.send_response(status)
+   382→        self.send_header('Content-Type', 'application/json; charset=utf-8')
+   383→        self.send_header('Access-Control-Allow-Origin', '*')
+   384→        self.send_header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+   385→        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+   386→        self.send_header('Content-Length', str(len(body)))
+   387→        self.end_headers()
+   388→        self.wfile.write(body)
+   389→
+   390→    def _send_file(self, filepath: str, filename: str):
+   391→        import mimetypes
+   392→        ctype = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+   393→        size = os.path.getsize(filepath)
+   394→        self.send_response(200)
+   395→        self.send_header('Content-Type', ctype)
+   396→        self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
+   397→        self.send_header('Access-Control-Allow-Origin', '*')
+   398→        self.send_header('Content-Length', str(size))
+   399→        self.end_headers()
+   400→        with open(filepath, 'rb') as f:
+   401→            while True:
+   402→                chunk = f.read(65536)
+   403→                if not chunk:
+   404→                    break
+   405→                self.wfile.write(chunk)
+   406→
+   407→    def _read_body(self) -> bytes:
+   408→        length = int(self.headers.get('Content-Length', 0))
+   409→        return self.rfile.read(length) if length > 0 else b''
+   410→
+   411→    def do_OPTIONS(self):
+   412→        self.send_response(200)
+   413→        self.send_header('Access-Control-Allow-Origin', '*')
+   414→        self.send_header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+   415→        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+   416→        self.end_headers()
+   417→
+   418→    def do_GET(self):
+   419→        parsed = urlparse(self.path)
+   420→        path = parsed.path
+   421→        params = parse_qs(parsed.query)
+   422→
+   423→        try:
+   424→            if path == '/api/status':
+   425→                loaded = save_state['sav_path'] is not None
+   426→                self._send_json({
+   427→                    'loaded': loaded,
+   428→                    'filename': os.path.basename(save_state['sav_path']) if loaded else None,
+   429→                })
+   430→
+   431→            elif path == '/api/meta':
+   432→                if not save_state['meta_parsed']:
+   433→                    self._send_json({'error': 'No save file loaded'}, 400)
+   434→                    return
+   435→                meta = save_state['meta_parsed']
+   436→                dlcs = meta.get('required_dlcs', {})
+   437→                if isinstance(dlcs, dict):
+   438→                    dlcs = dlcs.get(None, [])
+   439→                if not isinstance(dlcs, list):
+   440→                    dlcs = [dlcs]
+   441→                self._send_json({
+   442→                    'version': meta.get('version', ''),
+   443→                    'name': meta.get('name', ''),
+   444→                    'date': meta.get('date', ''),
+   445→                    'ironman': meta.get('ironman', False),
+   446→                    'dlcs': dlcs,
+   447→                    'meta_fleets': meta.get('meta_fleets', 0),
+   448→                    'meta_planets': meta.get('meta_planets', 0),
+   449→                })
+   450→
+   451→            elif path == '/api/countries':
+   452→                if not save_state['gamestate_parsed']:
+   453→                    self._send_json({'error': 'No save file loaded'}, 400)
+   454→                    return
+   455→                countries = get_countries_list(save_state['gamestate_parsed'])
+   456→                player_idx = find_player_country_id(save_state['gamestate_parsed'])
+   457→                self._send_json({
+   458→                    'countries': countries,
+   459→                    'player_country_id': str(player_idx),
+   460→                })
+   461→
+   462→            elif path == '/api/resources':
+   463→                if not save_state['gamestate_parsed']:
+   464→                    self._send_json({'error': 'No save file loaded'}, 400)
+   465→                    return
+   466→                country_id = params.get('country_id', ['0'])[0]
+   467→                resources = get_country_resources(save_state['gamestate_parsed'], int(country_id))
+   468→                budget = get_budget_info(save_state['gamestate_parsed'], int(country_id))
+   469→                labeled = {}
+   470→                for key in RESOURCE_KEYS:
+   471→                    val = resources.get(key, 0)
+   472→                    labeled[key] = {
+   473→                        'value': float(val) if val else 0.0,
+   474→                        'label': RESOURCE_LABELS.get(key, key),
+   475→                        'icon': RESOURCE_ICONS.get(key, ''),
+   476→                        'income': round(budget.get(key, 0.0), 2),
+   477→                    }
+   478→                self._send_json({
+   479→                    'resources': labeled,
+   480→                    'country_id': country_id,
+   481→                    'categories': RESOURCE_CATEGORIES,
+   482→                })
+   483→
+   484→            elif path == '/api/species':
+   485→                if not save_state['gamestate_parsed']:
+   486→                    self._send_json({'error': 'No save file loaded'}, 400)
+   487→                    return
+   488→                species_db = save_state['gamestate_parsed'].get('species_db', {})
+   489→                total = len(species_db) if isinstance(species_db, dict) else 0
+   490→                species = get_species_list(save_state['gamestate_parsed'], limit=50)
+   491→                self._send_json({'species': species, 'total': total})
+   492→
+   493→            elif path == '/api/date':
+   494→                if not save_state['gamestate_parsed']:
+   495→                    self._send_json({'error': 'No save file loaded'}, 400)
+   496→                    return
+   497→                date = save_state['gamestate_parsed'].get('date', '')
+   498→                self._send_json({'date': date})
+   499→
+   500→            elif path == '/api/stats':
+   501→                if not save_state['gamestate_parsed']:
+   502→                    self._send_json({'error': 'No save file loaded'}, 400)
+   503→                    return
+   504→                gs = save_state['gamestate_parsed']
+   505→                player_idx = find_player_country_id(gs)
+   506→                countries = gs.get('country', {})
+   507→                c_key = str(player_idx)
+   508→                country = countries.get(c_key, {}) if isinstance(countries, dict) else {}
+   509→                self._send_json({
+   510→                    'date': gs.get('date', ''),
+   511→                    'tick': gs.get('tick', 0),
+   512→                    'num_species': len(gs.get('species_db', {})) if isinstance(gs.get('species_db'), dict) else 0,
+   513→                    'num_countries': len(countries) if isinstance(countries, dict) else 0,
+   514→                    'player_country_id': str(player_idx),
+   515→                    'tech_count': get_tech_count(gs, player_idx),
+   516→                    'fleet_size': country.get('fleet_size', 0) if isinstance(country, dict) else 0,
+   517→                    'military_power': float(country.get('military_power', 0)) if isinstance(country, dict) else 0,
+   518→                    'empire_size': country.get('empire_size', 0) if isinstance(country, dict) else 0,
+   519→                    'owned_planets_count': len(country.get('owned_planets', {}).get(None, [])) if isinstance(country, dict) else 0,
+   520→                })
+   521→
+   522→            else:
+   523→                self._send_json({'error': 'Not found'}, 404)
+   524→
+   525→        except Exception as e:
+   526→            traceback.print_exc()
+   527→            self._send_json({'error': str(e)}, 500)
+   528→
+   529→    def do_POST(self):
+   530→        parsed = urlparse(self.path)
+   531→        path = parsed.path
+   532→
+   533→        try:
+   534→            if path == '/api/upload':
+   535→                body = self._read_body()
+   536→                if not body:
+   537→                    self._send_json({'error': 'No file data'}, 400)
+   538→                    return
+   539→
+   540→                # Save to temp file
+   541→                tmp = tempfile.NamedTemporaryFile(suffix='.sav', delete=False)
+   542→                tmp.write(body)
+   543→                tmp.close()
+   544→
+   545→                try:
+   546→                    meta_text, gamestate_text = extract_save(tmp.name)
+   547→                except Exception as e:
+   548→                    os.unlink(tmp.name)
+   549→                    self._send_json({'error': f'Failed to parse .sav file: {str(e)}'}, 400)
+   550→                    return
+   551→
+   552→                meta_parsed = parse_clausewitz(meta_text) if meta_text else {}
+   553→
+   554→                gamestate_parsed = {}
+   555→                try:
+   556→                    gamestate_parsed = parse_clausewitz(gamestate_text) if gamestate_text else {}
+   557→                except Exception as e:
+   558→                    print(f'Warning: Full gamestate parse failed: {e}')
+   559→
+   560→                save_state['sav_path'] = tmp.name
+   561→                save_state['meta_text'] = meta_text
+   562→                save_state['gamestate_text'] = gamestate_text
+   563→                save_state['meta_parsed'] = meta_parsed
+   564→                save_state['gamestate_parsed'] = gamestate_parsed
+   565→
+   566→                player_idx = find_player_country_id(gamestate_parsed)
+   567→                meta_name = meta_parsed.get('name', '')
+   568→                meta_date = meta_parsed.get('date', '')
+   569→
+   570→                dlcs = meta_parsed.get('required_dlcs', {})
+   571→                if isinstance(dlcs, dict):
+   572→                    dlcs = dlcs.get(None, [])
+   573→                if not isinstance(dlcs, list):
+   574→                    dlcs = [dlcs]
+   575→
+   576→                self._send_json({
+   577→                    'success': True,
+   578→                    'filename': os.path.basename(tmp.name),
+   579→                    'meta': {
+   580→                        'version': meta_parsed.get('version', ''),
+   581→                        'name': meta_name,
+   582→                        'date': meta_date,
+   583→                        'ironman': meta_parsed.get('ironman', False),
+   584→                        'dlcs': dlcs,
+   585→                        'meta_fleets': meta_parsed.get('meta_fleets', 0),
+   586→                        'meta_planets': meta_parsed.get('meta_planets', 0),
+   587→                    },
+   588→                    'player_country_id': str(player_idx),
+   589→                    'gamestate_size': len(gamestate_text),
+   590→                })
+   591→
+   592→            elif path == '/api/export':
+   593→                if not save_state['sav_path']:
+   594→                    self._send_json({'error': 'No save file loaded'}, 400)
+   595→                    return
+   596→
+   597→                # Create modified .sav file
+   598→                export_tmp = tempfile.NamedTemporaryFile(suffix='.sav', delete=False)
+   599→                export_tmp.close()
+   600→
+   601→                with zipfile.ZipFile(export_tmp.name, 'w', zipfile.ZIP_DEFLATED) as zout:
+   602→                    zout.writestr('meta', save_state['meta_text'].encode('utf-8'))
+   603→                    zout.writestr('gamestate', save_state['gamestate_text'].encode('utf-8'))
+   604→
+   605→                self._send_file(export_tmp.name, 'modified_save.sav')
+   606→
+   607→                # Clean up after sending
+   608→                os.unlink(export_tmp.name)
+   609→
+   610→            else:
+   611→                self._send_json({'error': 'Not found'}, 404)
+   612→
+   613→        except Exception as e:
+   614→            traceback.print_exc()
+   615→            self._send_json({'error': str(e)}, 500)
+   616→
+   617→    def do_PUT(self):
+   618→        parsed = urlparse(self.path)
+   619→        path = parsed.path
+   620→
+   621→        try:
+   622→            body = self._read_body()
+   623→            data = json.loads(body) if body else {}
+   624→
+   625→            if path == '/api/resources':
+   626→                if not save_state['gamestate_text']:
+   627→                    self._send_json({'error': 'No save file loaded'}, 400)
+   628→                    return
+   629→
+   630→                country_id = data.get('country_id', 0)
+   631→                resources = data.get('resources', {})
+   632→
+   633→                gs_text = save_state['gamestate_text']
+   634→                for key, value in resources.items():
+   635→                    try:
+   636→                        gs_text = modify_resource_in_text(gs_text, int(country_id), key, float(value))
+   637→                    except (ValueError, TypeError):
+   638→                        pass
+   639→
+   640→                save_state['gamestate_text'] = gs_text
+   641→
+   642→                # Re-parse to update cache
+   643→                try:
+   644→                    save_state['gamestate_parsed'] = parse_clausewitz(gs_text)
+   645→                except:
+   646→                    pass
+   647→
+   648→                self._send_json({'success': True, 'message': f'Updated {len(resources)} resources'})
+   649→
+   650→            elif path == '/api/date':
+   651→                if not save_state['gamestate_text']:
+   652→                    self._send_json({'error': 'No save file loaded'}, 400)
+   653→                    return
+   654→
+   655→                new_date = data.get('date', '')
+   656→                if not re.match(r'^\d{4}\.\d{2}\.\d{2}$', new_date):
+   657→                    self._send_json({'error': 'Invalid date format, use YYYY.MM.DD'}, 400)
+   658→                    return
+   659→
+   660→                save_state['gamestate_text'] = modify_date_in_text(save_state['gamestate_text'], new_date)
+   661→                save_state['meta_text'] = modify_date_in_text(save_state['meta_text'], new_date)
+   662→
+   663→                try:
+   664→                    save_state['gamestate_parsed'] = parse_clausewitz(save_state['gamestate_text'])
+   665→                    save_state['meta_parsed'] = parse_clausewitz(save_state['meta_text'])
+   666→                except:
+   667→                    pass
+   668→
+   669→                self._send_json({'success': True, 'date': new_date})
+   670→
+   671→            elif path == '/api/name':
+   672→                if not save_state['gamestate_text']:
+   673→                    self._send_json({'error': 'No save file loaded'}, 400)
+   674→                    return
+   675→
+   676→                new_name = data.get('name', '')
+   677→                old_name = save_state['meta_parsed'].get('name', '') if save_state['meta_parsed'] else ''
+   678→
+   679→                if old_name:
+   680→                    save_state['gamestate_text'] = modify_name_in_text(save_state['gamestate_text'], old_name, new_name)
+   681→                save_state['meta_text'] = modify_name_in_meta(save_state['meta_text'], new_name)
+   682→
+   683→                try:
+   684→                    save_state['gamestate_parsed'] = parse_clausewitz(save_state['gamestate_text'])
+   685→                    save_state['meta_parsed'] = parse_clausewitz(save_state['meta_text'])
+   686→                except:
+   687→                    pass
+   688→
+   689→                self._send_json({'success': True, 'name': new_name})
+   690→
+   691→            else:
+   692→                self._send_json({'error': 'Not found'}, 404)
+   693→
+   694→        except Exception as e:
+   695→            traceback.print_exc()
+   696→            self._send_json({'error': str(e)}, 500)
+   697→
+   698→    def do_DELETE(self):
+   699→        parsed = urlparse(self.path)
+   700→        path = parsed.path
+   701→
+   702→        try:
+   703→            if path == '/api/save':
+   704→                if save_state['sav_path'] and os.path.exists(save_state['sav_path']):
+   705→                    os.unlink(save_state['sav_path'])
+   706→                save_state['sav_path'] = None
+   707→                save_state['meta_text'] = None
+   708→                save_state['gamestate_text'] = None
+   709→                save_state['meta_parsed'] = None
+   710→                save_state['gamestate_parsed'] = None
+   711→                self._send_json({'success': True})
+   712→            else:
+   713→                self._send_json({'error': 'Not found'}, 404)
+   714→        except Exception as e:
+   715→            self._send_json({'error': str(e)}, 500)
+   716→
+   717→    def log_message(self, format, *args):
+   718→        print(f'[SAVE-SERVICE] {args[0]}')
+   719→
+   720→
+   721→def run_server(port=3001):
+   722→    server = HTTPServer(('0.0.0.0', port), SaveHandler)
+   723→    print(f'Stellaris Save Parser Service running on port {port}')
+   724→    try:
+   725→        server.serve_forever()
+   726→    except KeyboardInterrupt:
+   727→        print('\nShutting down...')
+   728→        server.server_close()
+   729→
+   730→
+   731→if __name__ == '__main__':
+   732→    port = int(os.environ.get('PORT', 3001))
+   733→    run_server(port)
+   734→
