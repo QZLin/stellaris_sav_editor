@@ -8,6 +8,7 @@ import {
   Monitor, Wrench, Wind, TestTubes, Diamond, Moon,
   Amphora, Orbit, Bot, AlertTriangle, Check, Loader2,
   Shield, Swords, Rocket, MapPin, BookOpen, Flag,
+  Clock, Palette,
 } from 'lucide-react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -24,8 +25,10 @@ import { useToast } from '@/hooks/use-toast';
 import {
   type SaveMeta, type GameStats, type ResourceInfo,
   type CountryInfo, type SpeciesInfo, type ResourceCategory,
+  type DelayedEvent, type FlagInfo, type FlagCategoryInfo,
   uploadSave, getMeta, getStats, getResources, getCountries,
   getSpecies, updateResources, updateDate, updateName,
+  getEvents, getFlag, updateEvents, updateFlag,
   exportSave, releaseSave,
 } from '@/lib/save-api';
 
@@ -79,6 +82,12 @@ export default function StellarisSaveEditor() {
   const [saving, setSaving] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [activeTab, setActiveTab] = useState('overview');
+  const [events, setEvents] = useState<DelayedEvent[]>([]);
+  const [editEvents, setEditEvents] = useState<Record<number, string>>({});
+  const [flagData, setFlagData] = useState<FlagInfo | null>(null);
+  const [flagCategories, setFlagCategories] = useState<Record<string, FlagCategoryInfo>>({});
+  const [flagBgs, setFlagBgs] = useState<string[]>([]);
+  const [flagColors, setFlagColors] = useState<string[]>([]);
 
   // Load save file
   const handleFileUpload = useCallback(async (file: File) => {
@@ -241,7 +250,11 @@ export default function StellarisSaveEditor() {
   const handleCountryChange = async (countryId: string) => {
     setSelectedCountry(countryId);
     try {
-      const data = await getResources(countryId);
+      const [data, evtData, flagResp] = await Promise.all([
+        getResources(countryId),
+        getEvents(countryId),
+        getFlag(countryId),
+      ]);
       setResources(data.resources);
       setResourceCategories(data.categories);
       const initEdit: Record<string, string> = {};
@@ -249,14 +262,60 @@ export default function StellarisSaveEditor() {
         initEdit[k] = v.value.toFixed(2);
       }
       setEditResources(initEdit);
+      // Events
+      setEvents(evtData.events);
+      const initEvt: Record<number, string> = {};
+      for (const e of evtData.events) initEvt[e.index] = String(e.days);
+      setEditEvents(initEvt);
+      // Flag
+      setFlagData(flagResp.flag);
+      setFlagCategories(flagResp.available_categories);
+      setFlagBgs(flagResp.available_backgrounds);
+      setFlagColors(flagResp.available_colors);
     } catch (err) {
-      toast({ title: '加载资源失败', description: err instanceof Error ? err.message : '', variant: 'destructive' });
+      toast({ title: '加载失败', description: err instanceof Error ? err.message : '', variant: 'destructive' });
     }
   };
 
   // Quick set resource value
   const setResourceValue = (key: string, value: string) => {
     setEditResources(prev => ({ ...prev, [key]: value }));
+  };
+
+  // Save events
+  const handleSaveEvents = async () => {
+    setSaving(true);
+    try {
+      const changes = events.map(e => ({
+        index: e.index,
+        days: parseInt(editEvents[e.index]) || 0,
+      }));
+      await updateEvents(selectedCountry, changes);
+      const data = await getEvents(selectedCountry);
+      setEvents(data.events);
+      const initEvt: Record<number, string> = {};
+      for (const e of data.events) initEvt[e.index] = String(e.days);
+      setEditEvents(initEvt);
+      toast({ title: '事件已更新' });
+    } catch (err) {
+      toast({ title: '更新失败', description: err instanceof Error ? err.message : '', variant: 'destructive' });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // Save flag
+  const handleSaveFlag = async () => {
+    if (!flagData) return;
+    setSaving(true);
+    try {
+      await updateFlag(selectedCountry, flagData);
+      toast({ title: '标志已更新' });
+    } catch (err) {
+      toast({ title: '更新失败', description: err instanceof Error ? err.message : '', variant: 'destructive' });
+    } finally {
+      setSaving(false);
+    }
   };
 
   // ============ RENDER: UPLOAD SCREEN ============
@@ -392,6 +451,12 @@ export default function StellarisSaveEditor() {
             </TabsTrigger>
             <TabsTrigger value="species" className="data-[state=active]:bg-amber-500/20 data-[state=active]:text-amber-100">
               <Dna className="h-3.5 w-3.5 mr-1.5" /> 物种
+            </TabsTrigger>
+            <TabsTrigger value="events" className="data-[state=active]:bg-amber-500/20 data-[state=active]:text-amber-100">
+              <Clock className="h-3.5 w-3.5 mr-1.5" /> 事件
+            </TabsTrigger>
+            <TabsTrigger value="flag" className="data-[state=active]:bg-amber-500/20 data-[state=active]:text-amber-100">
+              <Palette className="h-3.5 w-3.5 mr-1.5" /> 标志
             </TabsTrigger>
           </TabsList>
 
@@ -705,10 +770,181 @@ export default function StellarisSaveEditor() {
               </CardContent>
             </Card>
           </TabsContent>
+
+          {/* ===== EVENTS TAB ===== */}
+          <TabsContent value="events" className="space-y-6">
+            <Card className="border-amber-500/10 bg-black/40">
+              <CardContent className="p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+                <div className="flex items-center gap-3">
+                  <Label className="text-amber-200/70 text-sm">当前国家:</Label>
+                  <select value={selectedCountry} onChange={e => handleCountryChange(e.target.value)}
+                    className="bg-white/5 border border-gray-600 text-amber-50 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-amber-500/50">
+                    {countries.filter(c => c.name).map(c => (
+                      <option key={c.id} value={c.id} className="bg-gray-900">{c.name} (ID: {c.id})</option>
+                    ))}
+                  </select>
+                </div>
+                <Button onClick={handleSaveEvents} disabled={saving || events.length === 0}
+                  className="bg-amber-500 hover:bg-amber-400 text-black font-medium">
+                  {saving ? <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" /> : <Save className="h-3.5 w-3.5 mr-1.5" />}
+                  保存所有事件
+                </Button>
+              </CardContent>
+            </Card>
+            {events.length === 0 ? (
+              <Card className="border-gray-700/50 bg-black/30">
+                <CardContent className="p-8 text-center text-gray-500">当前国家没有进行中的延迟事件</CardContent>
+              </Card>
+            ) : (
+              <Card className="border-gray-700/50 bg-black/30">
+                <CardHeader className="pb-3">
+                  <CardTitle className="text-amber-100 text-base flex items-center gap-2">
+                    <Clock className="h-4 w-4" /> 延迟事件 ({events.length})
+                  </CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="space-y-3">
+                    {events.map((evt) => (
+                      <div key={evt.index} className="flex items-center gap-4 p-3 rounded-lg border bg-white/[0.02] border-gray-700/30">
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm text-amber-50 font-medium font-mono">{evt.event}</p>
+                          <div className="flex gap-3 mt-1 text-xs text-gray-500">
+                            <span>范围: {evt.scope_type} {evt.scope_id}</span>
+                            <span>原始: {evt.days} 天</span>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <Label className="text-xs text-gray-400">天数</Label>
+                          <Input type="number" value={editEvents[evt.index] || ''}
+                            onChange={e => setEditEvents(prev => ({ ...prev, [evt.index]: e.target.value }))}
+                            className="h-8 w-24 text-sm bg-transparent border-gray-600/50 text-amber-50 text-center" />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </CardContent>
+              </Card>
+            )}
+            <div className="flex flex-wrap gap-2">
+              <Button variant="outline" size="sm" className="border-gray-600 text-gray-300 hover:text-amber-200 hover:border-amber-500/30"
+                onClick={() => { const ne: Record<number, string> = {}; events.forEach(e => ne[e.index] = '0'); setEditEvents(ne); }}>
+                全部设为 0 天
+              </Button>
+              <Button variant="outline" size="sm" className="border-gray-600 text-gray-300 hover:text-amber-200 hover:border-amber-500/30"
+                onClick={() => { const ne: Record<number, string> = {}; events.forEach(e => ne[e.index] = '1'); setEditEvents(ne); }}>
+                全部设为 1 天
+              </Button>
+            </div>
+          </TabsContent>
+
+          {/* ===== FLAG TAB ===== */}
+          <TabsContent value="flag" className="space-y-6">
+            {flagData && (<>
+              <Card className="border-amber-500/10 bg-black/40">
+                <CardContent className="p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    <Label className="text-amber-200/70 text-sm">当前国家:</Label>
+                    <select value={selectedCountry} onChange={e => handleCountryChange(e.target.value)}
+                      className="bg-white/5 border border-gray-600 text-amber-50 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-amber-500/50">
+                      {countries.filter(c => c.name).map(c => (
+                        <option key={c.id} value={c.id} className="bg-gray-900">{c.name} (ID: {c.id})</option>
+                      ))}
+                    </select>
+                  </div>
+                  <Button onClick={handleSaveFlag} disabled={saving}
+                    className="bg-amber-500 hover:bg-amber-400 text-black font-medium">
+                    {saving ? <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" /> : <Save className="h-3.5 w-3.5 mr-1.5" />}
+                    保存标志
+                  </Button>
+                </CardContent>
+              </Card>
+              <Card className="border-gray-700/50 bg-black/30">
+                <CardHeader className="pb-3"><CardTitle className="text-amber-100 text-base flex items-center gap-2"><Palette className="h-4 w-4" /> 标志预览</CardTitle></CardHeader>
+                <CardContent>
+                  <div className="flex flex-wrap gap-6">
+                    <div className="space-y-2">
+                      <p className="text-xs text-gray-500">颜色预览</p>
+                      <div className="flex gap-1">
+                        {flagData.colors.slice(0, 2).map((c, i) => (
+                          <div key={i} className="w-16 h-10 rounded border border-gray-600"
+                            style={{ backgroundColor: c === 'null' ? 'transparent' : undefined,
+                              backgroundImage: c === 'null' ? 'repeating-linear-gradient(45deg, transparent, transparent 3px, rgba(255,255,255,0.05) 3px)' : undefined,
+                              borderStyle: c === 'null' ? 'dashed' : 'solid' }} title={c} />
+                        ))}
+                      </div>
+                    </div>
+                    <div className="text-xs text-gray-500 space-y-1">
+                      <p>图标: {flagData.icon_category}/{flagData.icon_file}</p>
+                      <p>背景: {flagData.bg_file}</p>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+              <Card className="border-gray-700/50 bg-black/30">
+                <CardHeader className="pb-3"><CardTitle className="text-amber-100 text-sm">图标类型</CardTitle></CardHeader>
+                <CardContent>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                    {Object.entries(flagCategories).map(([catKey, catInfo]) => (
+                      <button key={catKey}
+                        onClick={() => {
+                          const num = flagData.icon_category === catKey ? parseInt(flagData.icon_file.replace(/[^0-9]/g, '') || '1') : 1;
+                          setFlagData({ ...flagData, icon_category: catKey,
+                            icon_file: `${catInfo.prefix}${(catKey === 'domination' || catKey === 'aquatic' || catKey === 'caravaneer' || catKey === 'plantoid' || catKey === 'lithoid' || catKey === 'toxoid' || catKey === 'infernal' || catKey === 'legion') ? String(num).padStart(2, '0') : num}.dds`,
+                          });
+                        }}
+                        className={'p-3 rounded-lg border text-left transition-colors ' + (flagData.icon_category === catKey ? 'bg-amber-500/10 border-amber-500/30' : 'bg-white/[0.02] border-gray-700/30 hover:border-gray-600/50')}>
+                        <p className="text-sm text-amber-100 font-medium">{catInfo.label}</p>
+                        <p className="text-xs text-gray-500">{catInfo.prefix}* · {catInfo.dlc}</p>
+                      </button>
+                    ))}
+                  </div>
+                  {flagData.icon_category && (
+                    <div className="mt-4 flex items-center gap-3">
+                      <Label className="text-xs text-gray-400">图标编号:</Label>
+                      <Input type="number" min={1}
+                        value={parseInt(flagData.icon_file.replace(/[^0-9]/g, '') || '1')}
+                        onChange={e => {
+                          const num = parseInt(e.target.value) || 1;
+                          const cat = flagCategories[flagData.icon_category];
+                          if (!cat) return;
+                          const pad = (flagData.icon_category === 'domination' || flagData.icon_category === 'aquatic' || flagData.icon_category === 'caravaneer' || flagData.icon_category === 'plantoid' || flagData.icon_category === 'lithoid' || flagData.icon_category === 'toxoid' || flagData.icon_category === 'infernal' || flagData.icon_category === 'legion');
+                          setFlagData({ ...flagData, icon_file: `${cat.prefix}${pad ? String(num).padStart(2, '0') : num}.dds` });
+                        }}
+                        className="h-8 w-20 text-sm bg-transparent border-gray-600/50 text-amber-50" />
+                      <span className="text-xs text-gray-600">文件: {flagData.icon_file}</span>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+              <Card className="border-gray-700/50 bg-black/30">
+                <CardHeader className="pb-3"><CardTitle className="text-amber-100 text-sm">背景图案</CardTitle></CardHeader>
+                <CardContent>
+                  <select value={flagData.bg_file} onChange={e => setFlagData({ ...flagData, bg_file: e.target.value })}
+                    className="w-full bg-white/5 border border-gray-600 text-amber-50 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-amber-500/50">
+                    {flagBgs.map(bg => (<option key={bg} value={bg} className="bg-gray-900">{bg}</option>))}
+                  </select>
+                </CardContent>
+              </Card>
+              <Card className="border-gray-700/50 bg-black/30">
+                <CardHeader className="pb-3"><CardTitle className="text-amber-100 text-sm">标志颜色</CardTitle></CardHeader>
+                <CardContent>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    {flagData.colors.map((c, i) => (
+                      <div key={i} className="space-y-1">
+                        <Label className="text-xs text-gray-400">颜色 {i + 1} {i < 2 ? (i === 0 ? '(次要)' : '(主要)') : ''}</Label>
+                        <select value={c} onChange={e => { const nc = [...flagData.colors]; nc[i] = e.target.value; setFlagData({ ...flagData, colors: nc }); }}
+                          className="w-full bg-white/5 border border-gray-600 text-amber-50 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:border-amber-500/50">
+                          {flagColors.map(color => (<option key={color} value={color} className="bg-gray-900">{color}</option>))}
+                        </select>
+                      </div>
+                    ))}
+                  </div>
+                </CardContent>
+              </Card>
+            </>)}
+          </TabsContent>
         </Tabs>
       </main>
-
-      {/* Footer */}
       <footer className="border-t border-gray-800/50 mt-auto">
         <div className="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between text-xs text-gray-500">
           <span>Stellaris Save Editor  ·  Paradox Clausewitz Engine</span>

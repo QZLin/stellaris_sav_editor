@@ -174,3 +174,65 @@ export async function exportSave(): Promise<Blob> {
 export async function releaseSave() {
   return request<{ success: boolean }>(baseUrl('api/save'), { method: 'DELETE' });
 }
+
+// ===== New APIs: Events & Flag =====
+
+export interface DelayedEvent {
+  index: number;
+  event: string;
+  days: number;
+  scope_type: string;
+  scope_id: string;
+}
+
+export interface FlagInfo {
+  icon_category: string;
+  icon_file: string;
+  bg_category: string;
+  bg_file: string;
+  colors: string[];
+}
+
+export interface FlagCategoryInfo {
+  label: string;
+  prefix: string;
+  count: number;
+  dlc: string;
+}
+
+export interface EventsResponse {
+  events: DelayedEvent[];
+  country_id: string;
+}
+
+export interface FlagResponse {
+  flag: FlagInfo;
+  country_id: string;
+  available_categories: Record<string, FlagCategoryInfo>;
+  available_backgrounds: string[];
+  available_colors: string[];
+}
+
+export async function getEvents(countryId: string) {
+  return request<EventsResponse>(baseUrl(`api/events?country_id=${countryId}`));
+}
+
+export async function getFlag(countryId: string) {
+  return request<FlagResponse>(baseUrl(`api/flag?country_id=${countryId}`));
+}
+
+export async function updateEvents(countryId: string, events: { index: number; days: number }[]) {
+  return request<{ success: boolean; message: string }>(baseUrl('api/events'), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ country_id: countryId, events }),
+  });
+}
+
+export async function updateFlag(countryId: string, flag: FlagInfo) {
+  return request<{ success: boolean; message: string }>(baseUrl('api/flag'), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ country_id: countryId, flag }),
+  });
+}

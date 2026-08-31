@@ -373,6 +373,235 @@ def modify_name_in_meta(text: str, new_name: str) -> str:
     return pattern.sub(f'\\g<1>{new_name}\\g<2>', text, count=1)
 
 
+# ============ FLAG DATA ============
+
+FLAG_ICON_CATEGORIES = {
+    'human': {'label': '人类', 'prefix': 'flag_human_', 'count': 24, 'dlc': '基础'},
+    'spherical': {'label': '球形', 'prefix': 'flag_spherical_', 'count': 21, 'dlc': '基础'},
+    'ornate': {'label': '华丽', 'prefix': 'flag_ornate_', 'count': 24, 'dlc': '基础'},
+    'blocky': {'label': '方块', 'prefix': 'flag_blocky_', 'count': 24, 'dlc': '基础'},
+    'pointy': {'label': '尖形', 'prefix': 'flag_pointy_', 'count': 14, 'dlc': '基础'},
+    'pirate': {'label': '海盗', 'prefix': 'flag_pirate_', 'count': 8, 'dlc': '基础'},
+    'zoological': {'label': '动物', 'prefix': 'flag_zoological_', 'count': 22, 'dlc': '基础'},
+    'corporate': {'label': '企业', 'prefix': 'flag_corporate_', 'count': 7, 'dlc': 'MegaCorp'},
+    'domination': {'label': '霸权', 'prefix': 'domination_', 'count': 17, 'dlc': 'Nemesis'},
+    'plantoid': {'label': '植物', 'prefix': 'flag_plantoid_', 'count': 12, 'dlc': 'Plantoids'},
+    'lithoid': {'label': '岩石', 'prefix': 'flag_lithoid_', 'count': 6, 'dlc': 'Lithoids'},
+    'toxoid': {'label': '剧毒', 'prefix': 'flag_toxoid_', 'count': 11, 'dlc': 'Toxoids'},
+    'aquatic': {'label': '水生', 'prefix': 'aquatic_', 'count': 10, 'dlc': 'Aquatics'},
+    'caravaneer': {'label': '游牧', 'prefix': 'flag_caravaneer_', 'count': 3, 'dlc': '基础'},
+    'infernal': {'label': '地狱', 'prefix': 'flag_infernal_', 'count': 5, 'dlc': 'Anniversary'},
+    'legion': {'label': '军团', 'prefix': 'flag_legion_', 'count': 5, 'dlc': 'Nemesis'},
+}
+
+FLAG_BACKGROUNDS = [
+    '00_solid.dds', '01.dds', '02.dds', '03.dds', '04.dds',
+    'circle.dds', 'v.dds', 'sinus.dds', 'new_dawn.dds',
+    'flag_BG_01.dds', 'flag_BG_02.dds', 'flag_BG_03.dds', 'flag_BG_04.dds',
+    'flag_BG_05.dds', 'flag_BG_06.dds', 'flag_BG_07.dds', 'flag_BG_08.dds',
+    'flag_BG_09.dds', 'flag_BG_10.dds', 'flag_BG_11.dds', 'flag_BG_12.dds',
+    'flag_BG_13.dds', 'flag_BG_14.dds', 'flag_BG_15.dds', 'flag_BG_16.dds',
+    'flag_BG_17.dds', 'flag_BG_18.dds', 'flag_BG_19.dds', 'flag_BG_20.dds',
+    'flag_BG_21.dds', 'flag_BG_22.dds', 'flag_BG_23.dds', 'flag_BG_24.dds',
+    'pattern_01.dds', 'pattern_02.dds', 'pattern_03.dds', 'pattern_04.dds',
+    'pattern_05.dds', 'pattern_06.dds',
+]
+
+FLAG_COLORS = [
+    'red', 'dark_red', 'burgundy', 'crimson', 'true_red',
+    'blue', 'dark_blue', 'cobalt_blue', 'navy_blue', 'mid_blue',
+    'green', 'dark_green', 'lime_green', 'olive_green', 'forest_green',
+    'yellow', 'gold', 'dark_gold', 'amber',
+    'teal', 'dark_teal', 'turquoise', 'cyan',
+    'purple', 'dark_purple', 'violet', 'indigo', 'magenta',
+    'orange', 'dark_orange', 'rust', 'bronze',
+    'pink', 'hot_pink', 'dark_pink', 'fuchsia',
+    'brown', 'dark_brown', 'tan', 'beige', 'khaki',
+    'grey', 'dark_grey', 'silver', 'steel_grey',
+    'black', 'white', 'null',
+]
+
+
+def get_delayed_events(gamestate: dict, country_idx: int) -> list:
+    """Extract delayed events for a specific country."""
+    countries = gamestate.get('country', {})
+    c_key = str(country_idx)
+    if c_key not in countries:
+        return []
+    country = countries[c_key]
+    if not isinstance(country, dict):
+        return []
+    modules = country.get('modules', {})
+    if not isinstance(modules, dict):
+        return []
+    emod = modules.get('standard_event_module', {})
+    if not isinstance(emod, dict):
+        return []
+    events = emod.get('delayed_event', [])
+    if not isinstance(events, list):
+        return []
+    result = []
+    for i, evt in enumerate(events):
+        if not isinstance(evt, dict):
+            continue
+        result.append({
+            'index': i,
+            'event': str(evt.get('event', '')),
+            'days': int(evt.get('days', 0)),
+            'scope_type': evt.get('scope', {}).get('type', '') if isinstance(evt.get('scope'), dict) else '',
+            'scope_id': evt.get('scope', {}).get('id', '') if isinstance(evt.get('scope'), dict) else '',
+        })
+    return result
+
+
+def get_delayed_events_from_text(text, country_idx):
+    """Extract delayed events directly from raw text (fast, no full parse needed)."""
+    lines = text.split('\n')
+    state = 'seeking_country'
+    country_depth = 0
+    country_idx_found = False
+    econ_found = False
+    in_de = False
+    de_depth = 0
+    events = []
+    current_evt = {}
+    for line in lines:
+        stripped = line.strip()
+        opens = stripped.count('{')
+        closes = stripped.count('}')
+        if state == 'seeking_country':
+            if stripped == 'country={':
+                state = 'in_country'
+                country_depth = 1
+            continue
+        if state == 'in_country':
+            country_depth += opens - closes
+            if country_depth <= 0:
+                state = 'seeking_country'
+                continue
+            if not country_idx_found:
+                if re.match(r'^\s*' + re.escape(str(country_idx)) + r'=\{\s*$', line):
+                    country_idx_found = True
+                    continue
+            if country_idx_found and not econ_found:
+                if re.match(r'^\s*standard_economy_module\s*=\{\s*$', line):
+                    econ_found = True
+                    continue
+            if econ_found and not in_de:
+                if re.match(r'^\s*delayed_event\s*=\{\s*$', line):
+                    in_de = True
+                    de_depth = 0
+                    continue
+            if in_de:
+                de_depth += opens - closes
+                if de_depth <= 0:
+                    in_de = False
+                    continue
+                m = re.match(r'^\s*event="([^"]+)"', line)
+                if m:
+                    current_evt = {'event': m.group(1), 'days': 0}
+                    continue
+                m = re.match(r'^\s*days=(\d+)', line)
+                if m and current_evt:
+                    current_evt['days'] = int(m.group(1))
+                    events.append(current_evt)
+                    current_evt = {}
+                    continue
+    return events
+
+
+def get_country_flag(gamestate: dict, country_idx: int) -> dict:
+    """Extract flag data for a specific country."""
+    countries = gamestate.get('country', {})
+    c_key = str(country_idx)
+    if c_key not in countries:
+        return {}
+    country = countries[c_key]
+    if not isinstance(country, dict):
+        return {}
+    flag = country.get('flag', {})
+    if not isinstance(flag, dict):
+        return {}
+    icon = flag.get('icon', {})
+    bg = flag.get('background', {})
+    colors = flag.get('colors', {})
+    if isinstance(colors, dict):
+        colors = colors.get(None, [])
+    return {
+        'icon_category': icon.get('category', '') if isinstance(icon, dict) else '',
+        'icon_file': icon.get('file', '') if isinstance(icon, dict) else '',
+        'bg_category': bg.get('category', '') if isinstance(bg, dict) else '',
+        'bg_file': bg.get('file', '') if isinstance(bg, dict) else '',
+        'colors': [str(c) for c in colors] if isinstance(colors, list) else [],
+    }
+
+
+def modify_event_days_in_text(text: str, country_idx: int, event_index: int, new_days: int) -> str:
+    """Modify the days value of a specific delayed event in raw text."""
+    lines = text.split('\n')
+    state = 'seeking_country'
+    country_depth = 0
+    country_idx_found = False
+    econ_found = False
+    in_delayed_events = False
+    de_depth = 0
+    current_event_idx = -1
+    result_lines = []
+    modified = False
+
+    for line in lines:
+        if modified:
+            result_lines.append(line)
+            continue
+        stripped = line.strip()
+        opens = stripped.count('{')
+        closes = stripped.count('}')
+        if state == 'seeking_country':
+            if stripped == 'country={':
+                state = 'in_country'
+                country_depth = 1
+            result_lines.append(line)
+            continue
+        if state == 'in_country':
+            country_depth += opens - closes
+            if country_depth <= 0:
+                state = 'seeking_country'
+                result_lines.append(line)
+                continue
+            if not country_idx_found:
+                idx_pat = re.compile(r'\s*' + re.escape(str(country_idx)) + r'=\{\s*$', re.MULTILINE)
+                if idx_pat.match(line):
+                    country_idx_found = True
+                    result_lines.append(line)
+                    continue
+            if country_idx_found and not econ_found:
+                if re.match(r'^\s*standard_economy_module\s*=\{\s*$', line):
+                    econ_found = True
+                    result_lines.append(line)
+                    continue
+            if econ_found and not in_delayed_events:
+                if re.match(r'^\s*delayed_event\s*=\{\s*$', line):
+                    in_delayed_events = True
+                    de_depth = 0
+                    result_lines.append(line)
+                    continue
+            if in_delayed_events and not modified:
+                de_depth += opens - closes
+                if de_depth <= 0:
+                    in_delayed_events = False
+                    result_lines.append(line)
+                    continue
+                if de_depth == 1 and re.match(r'^\s*event=', line):
+                    current_event_idx += 1
+                if current_event_idx == event_index and re.match(r'^\s*days=', line):
+                    indent = line[:len(line) - len(line.lstrip())]
+                    result_lines.append(f'{indent}days={new_days}')
+                    modified = True
+                    continue
+            result_lines.append(line)
+            continue
+        result_lines.append(line)
+    return '\n'.join(result_lines)
 class SaveHandler(BaseHTTPRequestHandler):
     """HTTP request handler for save file operations."""
 
@@ -490,6 +719,28 @@ class SaveHandler(BaseHTTPRequestHandler):
                 species = get_species_list(save_state['gamestate_parsed'], limit=50)
                 self._send_json({'species': species, 'total': total})
 
+            elif path == '/api/events':
+                if not save_state['gamestate_text']:
+                    self._send_json({'error': 'No save file loaded'}, 400)
+                    return
+                country_id = int(params.get('country_id', [0])[0])
+                events = get_delayed_events_from_text(save_state['gamestate_text'], country_id)
+                self._send_json({'events': events, 'country_id': str(country_id)})
+
+            elif path == '/api/flag':
+                if not save_state['gamestate_parsed']:
+                    self._send_json({'error': 'No save file loaded'}, 400)
+                    return
+                country_id = int(params.get('country_id', [0])[0])
+                flag = get_country_flag(save_state['gamestate_parsed'], country_id)
+                self._send_json({
+                    'flag': flag,
+                    'country_id': str(country_id),
+                    'available_categories': FLAG_ICON_CATEGORIES,
+                    'available_backgrounds': FLAG_BACKGROUNDS,
+                    'available_colors': FLAG_COLORS,
+                })
+
             elif path == '/api/date':
                 if not save_state['gamestate_parsed']:
                     self._send_json({'error': 'No save file loaded'}, 400)
@@ -517,6 +768,28 @@ class SaveHandler(BaseHTTPRequestHandler):
                     'military_power': float(country.get('military_power', 0)) if isinstance(country, dict) else 0,
                     'empire_size': country.get('empire_size', 0) if isinstance(country, dict) else 0,
                     'owned_planets_count': len(country.get('owned_planets', {}).get(None, [])) if isinstance(country, dict) else 0,
+                })
+
+            elif path == '/api/events':
+                if not save_state['gamestate_parsed']:
+                    self._send_json({'error': 'No save file loaded'}, 400)
+                    return
+                country_id = int(params.get('country_id', [0])[0])
+                events = get_delayed_events(save_state['gamestate_parsed'], country_id)
+                self._send_json({'events': events, 'country_id': str(country_id)})
+
+            elif path == '/api/flag':
+                if not save_state['gamestate_parsed']:
+                    self._send_json({'error': 'No save file loaded'}, 400)
+                    return
+                country_id = int(params.get('country_id', [0])[0])
+                flag = get_country_flag(save_state['gamestate_parsed'], country_id)
+                self._send_json({
+                    'flag': flag,
+                    'country_id': str(country_id),
+                    'available_categories': FLAG_ICON_CATEGORIES,
+                    'available_backgrounds': FLAG_BACKGROUNDS,
+                    'available_colors': FLAG_COLORS,
                 })
 
             else:
@@ -687,6 +960,40 @@ class SaveHandler(BaseHTTPRequestHandler):
                     pass
 
                 self._send_json({'success': True, 'name': new_name})
+
+            elif path == '/api/events':
+                if not save_state['gamestate_text']:
+                    self._send_json({'error': 'No save file loaded'}, 400)
+                    return
+
+                country_id = int(data.get('country_id', 0))
+                event_changes = data.get('events', [])  # [{index, days}]
+
+                gs_text = save_state['gamestate_text']
+                for change in event_changes:
+                    evt_idx = change.get('index', -1)
+                    new_days = change.get('days', 0)
+                    if evt_idx >= 0:
+                        gs_text = modify_event_days_in_text(gs_text, country_id, evt_idx, int(new_days))
+
+                save_state['gamestate_text'] = gs_text
+                self._send_json({'success': True, 'message': f'Updated {len(event_changes)} events'})
+
+            elif path == '/api/flag':
+                if not save_state['gamestate_text']:
+                    self._send_json({'error': 'No save file loaded'}, 400)
+                    return
+
+                country_id = int(data.get('country_id', 0))
+                flag_data = data.get('flag', {})
+
+                save_state['gamestate_text'] = modify_flag_in_text(save_state['gamestate_text'], country_id, flag_data)
+                try:
+                    save_state['gamestate_parsed'] = parse_clausewitz(save_state['gamestate_text'])
+                except:
+                    pass
+
+                self._send_json({'success': True, 'message': 'Flag updated'})
 
             else:
                 self._send_json({'error': 'Not found'}, 404)
