@@ -1,8 +1,0 @@
-{
-  "name": "stellaris-save-parser",
-  "version": "1.0.0",
-  "private": true,
-  "scripts": {
-    "dev": "python3 server.py"
-  }
-}
