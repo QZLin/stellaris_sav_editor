@@ -17,6 +17,8 @@
 
 - 解析 `.sav` 存档（ZIP 格式，含 `gamestate` + `meta`）
 - 存档预拆分：country / species_db / fleet / leaders / galactic_object 按实体拆为独立文件
+- **国家选择器**：分组下拉（玩家帝国 / 常规帝国 / 堕落帝国 / 原始文明 / 其他实体），
+  切换任意国家后即可查看并编辑该国资源，展示军事/经济/科技/舰队实力
 - 查看/编辑国家资源（能源、矿物、合金等 17 种）
 - 修改游戏日期、帝国名称、帝国旗帜、延时事件
 - 导出修改后的存档（字节级精准修改，未改动的部分保持原样）
@@ -119,7 +121,7 @@ Paradox 引擎使用的文本格式：
 - 数字键（如 `0={...}`）表示隐式列表
 - 顶层的 `player` 块记录玩家国家
 
-### 存档预拆分（参考 [stellaris-sav-tool](https://github.com/QZLin/stellaris-sav-tool)）
+### 存档预拆分（参考 [stellaris_sav_tool](https://github.com/QZLin/stellaris_sav_tool)）
 
 上传时把 44MB 的 `gamestate` 按实体预拆分为 ~3500 个独立文本文件
 （`country_0.txt`、`fleet_42.txt`、...），核心设计：

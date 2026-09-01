@@ -1,21 +1,69 @@
 'use client';
 
-import { useState, useRef, useEffect } from 'react';
-import { Upload, Download, Loader2, FlaskConical } from 'lucide-react';
+import { useState, useRef, useEffect, useMemo } from 'react';
+import { Upload, Download, Loader2, FlaskConical, Crown } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { Badge } from '@/components/ui/badge';
 import { Separator } from '@/components/ui/separator';
 import { useToast } from '@/hooks/use-toast';
 import {
-  uploadSave, getMeta, getStats, getResources,
+  uploadSave, getMeta, getStats, getResources, getCountries,
   updateResources, updateDate, updateName,
   exportSave, releaseSave, loadTestSave, getStatus,
 } from '@/lib/save-api';
-import type { SaveMeta, GameStats, ResourceInfo, ResourcesResponse, UploadResponse } from '@/lib/save-api';
+import type { SaveMeta, GameStats, ResourceInfo, ResourcesResponse, UploadResponse, CountryInfo } from '@/lib/save-api';
 
 type Screen = 'upload' | 'editor';
+
+/** Human-readable labels for country types found in the gamestate. */
+const COUNTRY_TYPE_LABELS: Record<string, string> = {
+  default: '帝国',
+  fallen_empire: '堕落帝国',
+  awakened_fallen_empire: '觉醒帝国',
+  primitive: '原始文明',
+  dormant_marauders: '沉睡掠夺者',
+  marauder_raiders: '掠夺者',
+  enclave: '飞地',
+  faction: '派系',
+  neutral_faction: '中立派系',
+  drone_faction: '机械派系',
+  drone: '机械体',
+  cloud: '虚空之云',
+  amoeba: '太空变形虫',
+  crystal: '水晶实体',
+  tiyanki: '缇扬基',
+  tiyanki_garrison: '缇扬基驻守',
+  vluur: '弗鲁尔',
+  shroud: '虚境',
+  shroud_spirits: '虚境灵体',
+  caravaneer_home: '商队之家',
+  caravaneer_fleet: '商队舰队',
+  enigmatic_cache: '神秘缓存',
+  global_event: '全局事件',
+};
+
+function countryTypeLabel(type: string): string {
+  if (COUNTRY_TYPE_LABELS[type]) return COUNTRY_TYPE_LABELS[type];
+  if (type.startsWith('guardian')) return '守护者';
+  return type || '未知';
+}
+
+/** Optgroup bucket for the country selector. */
+function countryGroup(c: CountryInfo, playerId: string): string {
+  if (c.id === playerId) return '玩家帝国';
+  switch (c.type) {
+    case 'default': return '常规帝国';
+    case 'fallen_empire':
+    case 'awakened_fallen_empire': return '堕落帝国';
+    case 'primitive': return '原始文明';
+    default: return '其他实体';
+  }
+}
+
+const GROUP_ORDER = ['玩家帝国', '常规帝国', '堕落帝国', '原始文明', '其他实体'];
 
 export default function Home() {
   const [screen, setScreen] = useState<Screen>('upload');
@@ -30,7 +78,14 @@ export default function Home() {
   const [editResources, setEditResources] = useState<Record<string, string>>({});
   const [splitInfo, setSplitInfo] = useState<Record<string, number>>({});
   const [testSaveAvailable, setTestSaveAvailable] = useState(false);
+  const [countries, setCountries] = useState<CountryInfo[]>([]);
+  const [countriesLoading, setCountriesLoading] = useState(false);
+  const [countriesError, setCountriesError] = useState<string | null>(null);
+  const [selectedCountryId, setSelectedCountryId] = useState('');
   const fileRef = useRef<HTMLInputElement>(null);
+  /** Request-generation guards: discard stale async responses. */
+  const countriesReqRef = useRef(0);
+  const resourcesReqRef = useRef('');
   const { toast } = useToast();
 
   // Detect whether the backend has a server-side test save configured
@@ -43,12 +98,43 @@ export default function Home() {
     return () => { cancelled = true; };
   }, []);
 
+  /**
+   * Fetch the country list in the background. /api/countries long-polls
+   * server-side until the full gamestate parse completes (~1 min for 44MB),
+   * so this must never block the editor render. Retries on failure.
+   */
+  const startCountriesFetch = () => {
+    const reqId = ++countriesReqRef.current;
+    setCountriesLoading(true);
+    setCountriesError(null);
+    const attempt = async (n: number): Promise<void> => {
+      try {
+        const res = await getCountries();
+        if (reqId !== countriesReqRef.current) return; // stale (released / re-upload)
+        setCountries(res.countries);
+        setCountriesLoading(false);
+      } catch (err: any) {
+        if (reqId !== countriesReqRef.current) return;
+        if (n < 3) {
+          await new Promise((r) => setTimeout(r, 5000));
+          return attempt(n + 1);
+        }
+        setCountriesError(err.message || '国家列表加载失败');
+        setCountriesLoading(false);
+      }
+    };
+    attempt(0).catch(() => {});
+  };
+
   /** Shared post-upload flow: fetch stats + resources and enter the editor. */
   const applyUpload = async (res: UploadResponse) => {
     setFilename(res.filename);
     setMeta(res.meta);
     setEditName(res.meta.name);
     setSplitInfo(res.split_info ?? {});
+    setSelectedCountryId(res.player_country_id);
+    resourcesReqRef.current = res.player_country_id;
+    setCountries([]);
     const [s, r] = await Promise.all([getStats(), getResources(res.player_country_id)]);
     setStats(s);
     setResources(r.resources);
@@ -58,6 +144,8 @@ export default function Home() {
     for (const [k, v] of Object.entries(r.resources)) init[k] = String(v.value);
     setEditResources(init);
     setScreen('editor');
+    // Country list arrives later (needs the background full parse).
+    startCountriesFetch();
   };
 
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -89,21 +177,46 @@ export default function Home() {
     }
   };
 
+  /** Switch the edited country: refetch its resources from the backend. */
+  const handleSelectCountry = async (id: string) => {
+    if (!id || id === selectedCountryId) return;
+    setSelectedCountryId(id);
+    resourcesReqRef.current = id;
+    setEditResources({}); // clear stale inputs while loading
+    try {
+      const r = await getResources(id);
+      if (resourcesReqRef.current !== id) return; // user switched again
+      setResources(r.resources);
+      setResourceCategories(r.categories);
+      const init: Record<string, string> = {};
+      for (const [k, v] of Object.entries(r.resources)) init[k] = String(v.value);
+      setEditResources(init);
+    } catch (err: any) {
+      if (resourcesReqRef.current === id) {
+        toast({ title: '加载国家资源失败', description: err.message, variant: 'destructive' });
+      }
+    }
+  };
+
   const handleSaveResources = async () => {
-    if (!stats || !resources) return;
+    if (!resources) return;
+    const targetId = selectedCountryId || stats?.player_country_id || '0';
     const nums: Record<string, number> = {};
     for (const [k, v] of Object.entries(editResources)) {
       const n = Number(v);
       if (!isNaN(n)) nums[k] = n;
     }
     try {
-      await updateResources(stats.player_country_id, nums);
-      const r = await getResources(stats.player_country_id);
-      setResources(r.resources);
-      const init: Record<string, string> = {};
-      for (const [k, v] of Object.entries(r.resources)) init[k] = String(v.value);
-      setEditResources(init);
-      toast({ title: '资源已保存' });
+      await updateResources(targetId, nums);
+      const r = await getResources(targetId);
+      if (resourcesReqRef.current === targetId) {
+        setResources(r.resources);
+        const init: Record<string, string> = {};
+        for (const [k, v] of Object.entries(r.resources)) init[k] = String(v.value);
+        setEditResources(init);
+      }
+      const target = countries.find((c) => c.id === targetId);
+      toast({ title: '资源已保存', description: target ? `${target.name} (${targetId}) 的资源已更新` : undefined });
     } catch (err: any) {
       toast({ title: '保存失败', description: err.message, variant: 'destructive' });
     }
@@ -147,14 +260,37 @@ export default function Home() {
 
   const handleRelease = async () => {
     await releaseSave();
+    countriesReqRef.current++; // discard in-flight country list request
+    resourcesReqRef.current = '';
     setScreen('upload');
     setMeta(null);
     setStats(null);
     setResources(null);
     setEditResources({});
     setSplitInfo({});
+    setCountries([]);
+    setSelectedCountryId('');
+    setCountriesError(null);
+    setCountriesLoading(false);
     if (fileRef.current) fileRef.current.value = '';
   };
+
+  // Grouped + power-sorted options for the country selector.
+  const groupedCountries = useMemo(() => {
+    const playerId = stats?.player_country_id ?? '';
+    const groups: Record<string, CountryInfo[]> = {};
+    for (const c of countries) {
+      const g = countryGroup(c, playerId);
+      (groups[g] ??= []).push(c);
+    }
+    for (const list of Object.values(groups)) {
+      list.sort((a, b) => b.military_power - a.military_power);
+    }
+    return groups;
+  }, [countries, stats]);
+
+  const selectedCountry = countries.find((c) => c.id === selectedCountryId) ?? null;
+  const isPlayerCountry = !!stats && selectedCountryId === stats.player_country_id;
 
   if (screen === 'upload') {
     return (
@@ -240,6 +376,65 @@ export default function Home() {
           </div>
         </div>
 
+        {/* Country selector */}
+        <Card>
+          <CardHeader className="pb-3">
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <CardTitle className="text-base">国家选择</CardTitle>
+              {countriesLoading && (
+                <span className="text-xs text-muted-foreground flex items-center gap-1">
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                  国家列表解析中（后台全量解析）…
+                </span>
+              )}
+              {countriesError && (
+                <span className="text-xs text-red-500" title={countriesError}>国家列表加载失败（可重试上传）</span>
+              )}
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <select
+              id="country-select"
+              aria-label="选择国家"
+              className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+              value={selectedCountryId}
+              onChange={(e) => handleSelectCountry(e.target.value)}
+              disabled={countries.length === 0}
+            >
+              {countries.length === 0 ? (
+                <option value={selectedCountryId}>
+                  {countriesLoading ? '国家列表解析中…' : '国家列表不可用'}
+                </option>
+              ) : (
+                GROUP_ORDER
+                  .filter((g) => groupedCountries[g]?.length)
+                  .map((g) => (
+                    <optgroup key={g} label={`${g}（${groupedCountries[g].length}）`}>
+                      {groupedCountries[g].map((c) => (
+                        <option key={c.id} value={c.id}>
+                          {c.name || `（国家 ${c.id}）`}
+                        </option>
+                      ))}
+                    </optgroup>
+                  ))
+              )}
+            </select>
+            {selectedCountry && (
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                <Badge variant={isPlayerCountry ? 'default' : 'secondary'} className="gap-1">
+                  {isPlayerCountry && <Crown className="h-3 w-3" />}
+                  {countryTypeLabel(selectedCountry.type)}
+                </Badge>
+                <span>ID {selectedCountry.id}</span>
+                <span>军事 {Math.round(selectedCountry.military_power).toLocaleString()}</span>
+                <span>经济 {Math.round(selectedCountry.economy_power).toLocaleString()}</span>
+                <span>科技 {Math.round(selectedCountry.tech_power).toLocaleString()}</span>
+                <span>舰队 {selectedCountry.fleet_size}</span>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
         {/* Date & Name */}
         <Card>
           <CardContent className="pt-6 grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -264,10 +459,18 @@ export default function Home() {
         {resourceCategories && resources && (
           <Card>
             <CardHeader className="pb-3">
-              <div className="flex items-center justify-between">
-                <CardTitle className="text-base">资源编辑</CardTitle>
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <CardTitle className="text-base">资源编辑</CardTitle>
+                  {selectedCountry && (
+                    <span className="text-sm text-muted-foreground">— {selectedCountry.name}</span>
+                  )}
+                </div>
                 <Button size="sm" onClick={handleSaveResources}>保存全部</Button>
               </div>
+              {selectedCountry && !isPlayerCountry && (
+                <p className="text-xs text-amber-600">正在编辑非玩家国家的资源，保存后写入该国的存档数据</p>
+              )}
             </CardHeader>
             <CardContent className="space-y-4">
               {Object.entries(resourceCategories).map(([cat, keys]) => (
