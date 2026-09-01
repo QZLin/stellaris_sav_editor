@@ -1,10 +1,45 @@
-node_modules
-.next
-out
-build
-*.log
-.DS_Store
-.env*
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Next.js
+.next/
+out/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Build artifacts
+dist/
+build/
 *.tsbuildinfo
-next-env.d.ts
-__pycache__
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project-specific (not part of repo)
+skills/
+download/
+tool-results/
+scripts/
+worklog.md
+
+# Save parser temp files
+*.sav
+mini-services/save-parser/temp_*/

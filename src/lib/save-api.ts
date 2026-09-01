@@ -6,6 +6,12 @@
 const SERVICE_PORT = 3001;
 
 function baseUrl(path: string): string {
+  // In standalone mode, use NEXT_PUBLIC_API_URL if set
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL;
+  if (apiUrl) {
+    return `${apiUrl}/${path}`;
+  }
+  // Gateway mode: proxy through Next.js via XTransformPort
   return `/${path}?XTransformPort=${SERVICE_PORT}`;
 }
 

@@ -17,7 +17,7 @@ export const metadata: Metadata = {
   title: "群星存档修改器 | Stellaris Save Editor",
   description: "基于Web的群星(Stellaris)存档修改工具，支持资源编辑、日期修改、帝国改名等功能",
   icons: {
-    icon: "https://z-cdn.chatglm.cn/z-ai/static/logo.svg",
+    title: "Stellaris Save Editor",
   },
 };
 
