@@ -58,6 +58,34 @@ python server.py         # 标准库实现, 无需 pip install
 | `NEXT_PUBLIC_API_URL` | — | 前端直连后端（绕过代理） |
 | `SPLIT_BLOCKS` | `country,species_db,fleet,leaders,galactic_object` | 预拆分哪些顶层块 |
 | `SAVE_VERIFY` | `0` | `=1` 时上传后执行拆分-重组字节级校验 |
+| `TEST_SAVE` | — | 服务器端测试存档路径，启用 `POST /api/test/load`；未设置时若仓库根目录存在 `reference_save.sav` 则由 start.ps1 自动启用 |
+
+## 测试
+
+### 服务器端测试加载（无需浏览器选文件）
+
+`POST /api/test/load` 让后端直接从文件系统加载存档，走与 `/api/upload`
+完全相同的管线（解压 → 预拆分 → 后台全量解析），返回结构也一致，
+额外多 `test: true` 与 `source_path` 字段。适合脚本化测试与 E2E，
+无需 Playwright `setInputFiles` 模拟文件选择：
+
+```bash
+# 用 TEST_SAVE 环境变量指定的存档
+curl -X POST "http://127.0.0.1:3001/api/test/load"
+
+# 或显式指定服务器端 .sav 路径（优先级高于环境变量）
+curl -X POST "http://127.0.0.1:3001/api/test/load" \
+  -H "Content-Type: application/json" \
+  -d '{"path": "D:/Saves/ironman.sav"}'
+```
+
+说明：
+
+- 加载的是**临时副本**，`释放存档`/`DELETE /api/save` 只清理副本，
+  源 `.sav` 文件保持原样（md5 不变）
+- `GET /api/status` 返回 `test_save.available/path`，前端据此在上传页
+  显示「加载服务器测试存档」按钮（一键加载，同样无需选文件）
+- 未配置时返回 400 与中文指引
 
 ## 项目结构
 

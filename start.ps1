@@ -16,6 +16,9 @@
 #    SPLIT_BLOCKS   预拆分顶层块, 逗号分隔 (默认 country,species_db,fleet,
 #                   leaders,galactic_object; "all" 见 save_splitter.py)
 #    SAVE_VERIFY=1  上传后执行拆分-重组字节级校验(调试用)
+#    TEST_SAVE      服务器端测试存档路径, 启用 POST /api/test/load 与前端
+#                   「加载服务器测试存档」按钮; 未设置时若仓库根目录存在
+#                   reference_save.sav 会自动启用
 # ============================================================
 
 param(
@@ -94,6 +97,14 @@ $pyProc = $null
 if (Test-BackendAlive $BackendPort) {
     Write-Step "Python 后端已在端口 $BackendPort 运行, 跳过启动"
 } else {
+    # 服务器端测试存档 (可选): 仓库根目录有 reference_save.sav 时自动启用
+    if (-not $env:TEST_SAVE) {
+        $testSav = Join-Path $Root 'reference_save.sav'
+        if (Test-Path $testSav) {
+            $env:TEST_SAVE = $testSav
+            Write-Ok "检测到测试存档: $testSav (已启用 /api/test/load)"
+        }
+    }
     Write-Step "启动 Python 后端 (uv run server.py, 端口 $BackendPort)"
     $env:PORT = "$BackendPort"
     # 后台隐藏窗口运行; 记录 PID 以便退出时清理

@@ -88,6 +88,23 @@ export interface UploadResponse {
   split_info?: Record<string, number>;
 }
 
+export interface TestLoadResponse extends UploadResponse {
+  /** true when the save was loaded server-side via /api/test/load */
+  test: boolean;
+  /** absolute path of the server-side .sav that was loaded */
+  source_path: string;
+}
+
+export interface StatusResponse {
+  loaded: boolean;
+  filename: string | null;
+  parsing: boolean;
+  test_save: {
+    available: boolean;
+    path: string | null;
+  };
+}
+
 export interface ResourcesResponse {
   resources: Record<string, ResourceInfo>;
   country_id: string;
@@ -131,8 +148,22 @@ export async function uploadSave(file: File): Promise<UploadResponse> {
   });
 }
 
+/**
+ * Server-side test loader: ask the backend to load a .sav directly from
+ * its own filesystem - no browser file input (or Playwright setInputFiles)
+ * needed. Path resolution: explicit `path` argument first, then the
+ * backend's TEST_SAVE environment variable.
+ */
+export async function loadTestSave(path?: string): Promise<TestLoadResponse> {
+  return request<TestLoadResponse>(baseUrl('api/test/load'), {
+    method: 'POST',
+    headers: path ? { 'Content-Type': 'application/json' } : undefined,
+    body: path ? JSON.stringify({ path }) : undefined,
+  });
+}
+
 export async function getStatus() {
-  return request<{ loaded: boolean; filename: string | null }>(baseUrl('api/status'));
+  return request<StatusResponse>(baseUrl('api/status'));
 }
 
 export async function getMeta() {

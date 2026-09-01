@@ -1,18 +1,19 @@
 'use client';
 
-import { useState, useRef } from 'react';
-import { Upload, Download, Loader2 } from 'lucide-react';
+import { useState, useRef, useEffect } from 'react';
+import { Upload, Download, Loader2, FlaskConical } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { Separator } from '@/components/ui/separator';
 import { useToast } from '@/hooks/use-toast';
 import {
   uploadSave, getMeta, getStats, getResources,
   updateResources, updateDate, updateName,
-  exportSave, releaseSave,
+  exportSave, releaseSave, loadTestSave, getStatus,
 } from '@/lib/save-api';
-import type { SaveMeta, GameStats, ResourceInfo, ResourcesResponse } from '@/lib/save-api';
+import type { SaveMeta, GameStats, ResourceInfo, ResourcesResponse, UploadResponse } from '@/lib/save-api';
 
 type Screen = 'upload' | 'editor';
 
@@ -28,8 +29,36 @@ export default function Home() {
   const [editName, setEditName] = useState('');
   const [editResources, setEditResources] = useState<Record<string, string>>({});
   const [splitInfo, setSplitInfo] = useState<Record<string, number>>({});
+  const [testSaveAvailable, setTestSaveAvailable] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const { toast } = useToast();
+
+  // Detect whether the backend has a server-side test save configured
+  // (TEST_SAVE env var) - enables the one-click test loader button.
+  useEffect(() => {
+    let cancelled = false;
+    getStatus()
+      .then((s) => { if (!cancelled) setTestSaveAvailable(!!s.test_save?.available); })
+      .catch(() => { /* backend down: keep the file-upload flow */ });
+    return () => { cancelled = true; };
+  }, []);
+
+  /** Shared post-upload flow: fetch stats + resources and enter the editor. */
+  const applyUpload = async (res: UploadResponse) => {
+    setFilename(res.filename);
+    setMeta(res.meta);
+    setEditName(res.meta.name);
+    setSplitInfo(res.split_info ?? {});
+    const [s, r] = await Promise.all([getStats(), getResources(res.player_country_id)]);
+    setStats(s);
+    setResources(r.resources);
+    setResourceCategories(r.categories);
+    setEditDate(s.date);
+    const init: Record<string, string> = {};
+    for (const [k, v] of Object.entries(r.resources)) init[k] = String(v.value);
+    setEditResources(init);
+    setScreen('editor');
+  };
 
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -37,22 +66,24 @@ export default function Home() {
     setLoading(true);
     try {
       const res = await uploadSave(file);
-      setFilename(res.filename);
-      setMeta(res.meta);
-      setEditName(res.meta.name);
-      setSplitInfo(res.split_info ?? {});
-      const [s, r] = await Promise.all([getStats(), getResources(res.player_country_id)]);
-      setStats(s);
-      setResources(r.resources);
-      setResourceCategories(r.categories);
-      setEditDate(s.date);
-      const init: Record<string, string> = {};
-      for (const [k, v] of Object.entries(r.resources)) init[k] = String(v.value);
-      setEditResources(init);
-      setScreen('editor');
+      await applyUpload(res);
       toast({ title: '上传成功', description: `${res.meta.name} (${res.meta.date})` });
     } catch (err: any) {
       toast({ title: '上传失败', description: err.message, variant: 'destructive' });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  /** Load the backend-side test save via POST /api/test/load (no file input). */
+  const handleLoadTestSave = async () => {
+    setLoading(true);
+    try {
+      const res = await loadTestSave();
+      await applyUpload(res);
+      toast({ title: '测试存档已加载', description: `${res.meta.name} (${res.meta.date})` });
+    } catch (err: any) {
+      toast({ title: '加载测试存档失败', description: err.message, variant: 'destructive' });
     } finally {
       setLoading(false);
     }
@@ -156,6 +187,27 @@ export default function Home() {
                 disabled={loading}
               />
             </label>
+            {testSaveAvailable && (
+              <>
+                <div className="flex items-center gap-3 mt-4">
+                  <Separator className="flex-1" />
+                  <span className="text-xs text-muted-foreground">或</span>
+                  <Separator className="flex-1" />
+                </div>
+                <Button
+                  variant="outline"
+                  className="w-full mt-3"
+                  onClick={handleLoadTestSave}
+                  disabled={loading}
+                >
+                  <FlaskConical className="h-4 w-4 mr-2" />
+                  加载服务器测试存档
+                </Button>
+                <p className="text-xs text-muted-foreground mt-2 text-center">
+                  直接从后端加载 TEST_SAVE 指定的存档，无需选择文件
+                </p>
+              </>
+            )}
           </CardContent>
         </Card>
       </div>

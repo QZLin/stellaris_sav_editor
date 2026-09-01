@@ -15,6 +15,10 @@ Upload pipeline:
   4. full gamestate parse continues in a background thread (for endpoints
      that need global data: /api/countries, /api/species)
 
+Testing: POST /api/test/load loads a server-side .sav directly (path taken
+from the request body or the TEST_SAVE env var), so scripted / E2E tests do
+not need a browser file upload (setInputFiles) at all.
+
 Endpoints that only need per-entity data (resources / stats / events / flag)
 read split files and never wait for the full parse.
 
@@ -26,6 +30,7 @@ import os
 import sys
 import json
 import re
+import shutil
 import zipfile
 import tempfile
 import threading
@@ -751,6 +756,122 @@ def _cleanup_all():
     save_state['generation'] += 1
 
 
+def _resolve_test_save(req_path):
+    """
+    Resolve which server-side .sav /api/test/load should use.
+    Priority: explicit request path, then the TEST_SAVE env var.
+    Returns (path, error) - exactly one of them is None.
+    """
+    if req_path is not None and not isinstance(req_path, str):
+        req_path = None
+    candidates = []
+    if req_path:
+        candidates.append(req_path)
+    env_path = os.environ.get('TEST_SAVE')
+    if env_path:
+        candidates.append(env_path)
+    for cand in candidates:
+        if not cand:
+            continue
+        p = os.path.abspath(cand)
+        if not p.lower().endswith('.sav'):
+            return None, f'仅支持 .sav 文件: {p}'
+        if not os.path.isfile(p):
+            return None, f'存档文件不存在: {p}'
+        return p, None
+    return None, ('未指定测试存档: 请在请求体传 {"path": "服务器端 .sav 路径"} '
+                  '或为后端设置 TEST_SAVE 环境变量')
+
+
+def _load_sav_pipeline(sav_path):
+    """
+    Shared load pipeline for /api/upload and /api/test/load:
+    extract -> meta parse -> pre-split -> (background) full parse.
+
+    MUST be called with _state_lock held, on a fresh temp .sav path,
+    right after _cleanup_all(). Returns the response payload dict and
+    raises on invalid .sav files (caller maps that to HTTP 400).
+    """
+    meta_text, gamestate_text = extract_save(sav_path)
+
+    meta_parsed = parse_clausewitz(meta_text) if meta_text else {}
+
+    save_state['sav_path'] = sav_path
+    save_state['meta_text'] = meta_text
+    save_state['gamestate_text'] = gamestate_text
+    save_state['meta_parsed'] = meta_parsed
+    save_state['country_parsed_cache'] = {}
+
+    # Fast player country lookup (small-window parse)
+    player_idx = find_player_country_id_in_text(gamestate_text)
+    save_state['player_country_id'] = player_idx
+
+    # Pre-split the gamestate for fast per-entity access.
+    # Falls back gracefully if splitting fails.
+    work_dir = os.path.join(
+        os.path.dirname(sav_path),
+        f'stellaris_split_{os.path.basename(sav_path)}')
+    try:
+        print('[UPLOAD] Starting gamestate split...')
+        manifest = split_gamestate(gamestate_text, work_dir)
+        save_state['work_dir'] = work_dir
+        save_state['manifest'] = manifest
+        print('[UPLOAD] Split complete')
+        if os.environ.get('SAVE_VERIFY') == '1':
+            ok = verify_roundtrip(gamestate_text, manifest, work_dir)
+            print(f'[UPLOAD] Roundtrip verify: {"PASS" if ok else "FAIL"}')
+    except Exception as e:
+        print(f'[UPLOAD] Warning: Split failed: {e}')
+        traceback.print_exc()
+        save_state['work_dir'] = None
+        save_state['manifest'] = None
+
+    if save_state['manifest']:
+        # Split succeeded: full parse can run in the
+        # background - the response goes out NOW.
+        _start_background_parse(save_state['generation'],
+                                gamestate_text)
+    else:
+        # No split: parse synchronously (old behaviour)
+        print('[UPLOAD] Starting full gamestate parse...')
+        gamestate_parsed = parse_clausewitz(gamestate_text) if gamestate_text else {}
+        print('[UPLOAD] Full parse complete')
+        save_state['gamestate_parsed'] = gamestate_parsed
+
+    meta_name = meta_parsed.get('name', '')
+    meta_date = meta_parsed.get('date', '')
+
+    dlcs = meta_parsed.get('required_dlcs', {})
+    if isinstance(dlcs, dict):
+        dlcs = dlcs.get(None, [])
+    if not isinstance(dlcs, list):
+        dlcs = [dlcs]
+
+    # Report split info
+    split_info = {}
+    if save_state['manifest']:
+        for bname, info in save_state['manifest'].get('split_info', {}).items():
+            split_info[bname] = len(info)
+
+    return {
+        'success': True,
+        'filename': os.path.basename(sav_path),
+        'meta': {
+            'version': meta_parsed.get('version', ''),
+            'name': meta_name,
+            'date': meta_date,
+            'ironman': meta_parsed.get('ironman', False),
+            'dlcs': dlcs,
+            'meta_fleets': meta_parsed.get('meta_fleets', 0),
+            'meta_planets': meta_parsed.get('meta_planets', 0),
+        },
+        'player_country_id': str(player_idx),
+        'gamestate_size': len(gamestate_text),
+        'split_info': split_info,
+        'background_parse': bool(save_state.get('parse_thread')),
+    }
+
+
 class SaveHandler(BaseHTTPRequestHandler):
     """HTTP request handler for save file operations."""
 
@@ -808,6 +929,14 @@ class SaveHandler(BaseHTTPRequestHandler):
                         'parsing': bool(save_state.get('parse_thread')
                                         and save_state['parse_thread'].is_alive()),
                     }
+                # /api/test/load availability (env-configured, lock-free).
+                env_ts = os.environ.get('TEST_SAVE')
+                ts_path = os.path.abspath(env_ts) if env_ts else None
+                payload['test_save'] = {
+                    'available': bool(ts_path and ts_path.lower().endswith('.sav')
+                                      and os.path.isfile(ts_path)),
+                    'path': ts_path,
+                }
                 self._send_json(payload)
 
             elif path == '/api/meta':
@@ -989,99 +1118,66 @@ class SaveHandler(BaseHTTPRequestHandler):
                     self._send_json({'error': 'No file data'}, 400)
                     return
 
+                # Save to temp file
+                tmp = tempfile.NamedTemporaryFile(suffix='.sav', delete=False)
+                tmp.write(body)
+                tmp.close()
+
                 with _state_lock:
                     # Clean up any previous state
                     _cleanup_all()
-
-                    # Save to temp file
-                    tmp = tempfile.NamedTemporaryFile(suffix='.sav', delete=False)
-                    tmp.write(body)
-                    tmp.close()
-
                     try:
-                        meta_text, gamestate_text = extract_save(tmp.name)
+                        payload = _load_sav_pipeline(tmp.name)
                     except Exception as e:
                         os.unlink(tmp.name)
                         self._send_json({'error': f'Failed to parse .sav file: {str(e)}'}, 400)
                         return
 
-                    meta_parsed = parse_clausewitz(meta_text) if meta_text else {}
+                self._send_json(payload)
 
-                    save_state['sav_path'] = tmp.name
-                    save_state['meta_text'] = meta_text
-                    save_state['gamestate_text'] = gamestate_text
-                    save_state['meta_parsed'] = meta_parsed
-                    save_state['country_parsed_cache'] = {}
-
-                    # Fast player country lookup (small-window parse)
-                    player_idx = find_player_country_id_in_text(gamestate_text)
-                    save_state['player_country_id'] = player_idx
-
-                    # Pre-split the gamestate for fast per-entity access.
-                    # Falls back gracefully if splitting fails.
-                    work_dir = os.path.join(
-                        os.path.dirname(tmp.name),
-                        f'stellaris_split_{os.path.basename(tmp.name)}')
+            elif path == '/api/test/load':
+                # Server-side test loader: load a .sav straight from the
+                # backend filesystem - no browser file input / setInputFiles
+                # needed. Path resolution order:
+                #   1. JSON body {"path": "<server-side .sav>"}
+                #   2. TEST_SAVE environment variable
+                body = self._read_body()
+                req_path = None
+                if body:
                     try:
-                        print('[UPLOAD] Starting gamestate split...')
-                        manifest = split_gamestate(gamestate_text, work_dir)
-                        save_state['work_dir'] = work_dir
-                        save_state['manifest'] = manifest
-                        print('[UPLOAD] Split complete')
-                        if os.environ.get('SAVE_VERIFY') == '1':
-                            ok = verify_roundtrip(gamestate_text, manifest, work_dir)
-                            print(f'[UPLOAD] Roundtrip verify: {"PASS" if ok else "FAIL"}')
+                        req_path = json.loads(body).get('path')
+                    except (ValueError, AttributeError):
+                        req_path = None
+                src, err = _resolve_test_save(req_path)
+                if err:
+                    self._send_json({'error': err}, 400)
+                    return
+
+                # Copy into a temp file so a later /api/save DELETE cleanup
+                # never unlinks the source .sav on the server.
+                tmp = tempfile.NamedTemporaryFile(suffix='.sav', delete=False)
+                try:
+                    with open(src, 'rb') as f:
+                        shutil.copyfileobj(f, tmp)
+                except OSError as e:
+                    tmp.close()
+                    os.unlink(tmp.name)
+                    self._send_json({'error': f'Cannot read test save: {e}'}, 400)
+                    return
+                tmp.close()
+
+                with _state_lock:
+                    _cleanup_all()
+                    try:
+                        payload = _load_sav_pipeline(tmp.name)
                     except Exception as e:
-                        print(f'[UPLOAD] Warning: Split failed: {e}')
-                        traceback.print_exc()
-                        save_state['work_dir'] = None
-                        save_state['manifest'] = None
+                        os.unlink(tmp.name)
+                        self._send_json({'error': f'Failed to parse .sav file: {str(e)}'}, 400)
+                        return
+                    payload['test'] = True
+                    payload['source_path'] = src
 
-                    if save_state['manifest']:
-                        # Split succeeded: full parse can run in the
-                        # background - the response goes out NOW.
-                        _start_background_parse(save_state['generation'],
-                                                gamestate_text)
-                        gamestate_parsed = None
-                    else:
-                        # No split: parse synchronously (old behaviour)
-                        print('[UPLOAD] Starting full gamestate parse...')
-                        gamestate_parsed = parse_clausewitz(gamestate_text) if gamestate_text else {}
-                        print('[UPLOAD] Full parse complete')
-                        save_state['gamestate_parsed'] = gamestate_parsed
-
-                    meta_name = meta_parsed.get('name', '')
-                    meta_date = meta_parsed.get('date', '')
-
-                    dlcs = meta_parsed.get('required_dlcs', {})
-                    if isinstance(dlcs, dict):
-                        dlcs = dlcs.get(None, [])
-                    if not isinstance(dlcs, list):
-                        dlcs = [dlcs]
-
-                    # Report split info
-                    split_info = {}
-                    if save_state['manifest']:
-                        for bname, info in save_state['manifest'].get('split_info', {}).items():
-                            split_info[bname] = len(info)
-
-                self._send_json({
-                    'success': True,
-                    'filename': os.path.basename(tmp.name),
-                    'meta': {
-                        'version': meta_parsed.get('version', ''),
-                        'name': meta_name,
-                        'date': meta_date,
-                        'ironman': meta_parsed.get('ironman', False),
-                        'dlcs': dlcs,
-                        'meta_fleets': meta_parsed.get('meta_fleets', 0),
-                        'meta_planets': meta_parsed.get('meta_planets', 0),
-                    },
-                    'player_country_id': str(player_idx),
-                    'gamestate_size': len(gamestate_text),
-                    'split_info': split_info,
-                    'background_parse': bool(save_state.get('parse_thread')),
-                })
+                self._send_json(payload)
 
             elif path == '/api/export':
                 with _state_lock:
