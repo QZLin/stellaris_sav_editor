@@ -43,3 +43,8 @@ worklog.md
 # Save parser temp files
 *.sav
 mini-services/save-parser/temp_*/
+stellaris_split_*/
+
+# PowerShell start script logs
+backend.log
+backend.err.log

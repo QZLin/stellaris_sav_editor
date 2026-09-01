@@ -27,6 +27,7 @@ export default function Home() {
   const [editDate, setEditDate] = useState('');
   const [editName, setEditName] = useState('');
   const [editResources, setEditResources] = useState<Record<string, string>>({});
+  const [splitInfo, setSplitInfo] = useState<Record<string, number>>({});
   const fileRef = useRef<HTMLInputElement>(null);
   const { toast } = useToast();
 
@@ -39,6 +40,7 @@ export default function Home() {
       setFilename(res.filename);
       setMeta(res.meta);
       setEditName(res.meta.name);
+      setSplitInfo(res.split_info ?? {});
       const [s, r] = await Promise.all([getStats(), getResources(res.player_country_id)]);
       setStats(s);
       setResources(r.resources);
@@ -119,6 +121,7 @@ export default function Home() {
     setStats(null);
     setResources(null);
     setEditResources({});
+    setSplitInfo({});
     if (fileRef.current) fileRef.current.value = '';
   };
 
@@ -166,7 +169,14 @@ export default function Home() {
         <div className="flex items-center justify-between">
           <div>
             <h1 className="text-xl font-bold">{meta?.name}</h1>
-            <p className="text-sm text-muted-foreground">{meta?.date} | {stats?.num_countries} 国家 | {stats?.num_species} 物种</p>
+            <p className="text-sm text-muted-foreground">
+              {meta?.date} | {stats?.num_countries} 国家 | {stats?.num_species} 物种
+              {Object.keys(splitInfo).length > 0 && (
+                <span className="ml-2 text-muted-foreground/60">
+                  (预拆分: {Object.entries(splitInfo).map(([k, v]) => `${k}×${v}`).join(' / ')})
+                </span>
+              )}
+            </p>
           </div>
           <div className="flex gap-2">
             <Button variant="outline" size="sm" onClick={handleExport}>

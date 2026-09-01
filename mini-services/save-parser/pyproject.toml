@@ -1,0 +1,6 @@
+[project]
+name = "save-parser"
+version = "0.1.0"
+description = "Stellaris .sav parser / pre-splitter / editor HTTP service (stdlib only)"
+requires-python = ">=3.10"
+dependencies = []

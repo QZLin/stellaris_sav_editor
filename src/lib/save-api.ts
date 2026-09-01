@@ -1,18 +1,27 @@
 /**
  * API client for the Python save parser service.
- * All requests go through the gateway using XTransformPort.
+ *
+ * Request routing (all three paths reach the same backend):
+ *   1. Platform hosting: relative URL + XTransformPort param -> the edge
+ *      gateway forwards the request to the backend port directly.
+ *   2. Local deployment: relative URL -> the catch-all proxy route
+ *      (src/app/api/[...path]/route.ts) forwards it to 127.0.0.1:3001.
+ *   3. NEXT_PUBLIC_API_URL set (e.g. http://127.0.0.1:3001) -> the browser
+ *      calls the backend directly, bypassing any proxy.
  */
 
 const SERVICE_PORT = 3001;
 
 function baseUrl(path: string): string {
-  // In standalone mode, use NEXT_PUBLIC_API_URL if set
   const apiUrl = process.env.NEXT_PUBLIC_API_URL;
   if (apiUrl) {
-    return `${apiUrl}/${path}`;
+    return `${apiUrl.replace(/\/+$/, "")}/${path}`;
   }
-  // Gateway mode: proxy through Next.js via XTransformPort
-  return `/${path}?XTransformPort=${SERVICE_PORT}`;
+  // Join query strings correctly: a path that already carries a query (e.g.
+  // "api/resources?country_id=0") must be extended with "&", not "?" -
+  // the old unconditional "?" produced "?country_id=0?XTransformPort=3001"
+  // which the backend could not parse (500).
+  return `/${path}${path.includes("?") ? "&" : "?"}XTransformPort=${SERVICE_PORT}`;
 }
 
 export interface SaveMeta {
@@ -114,8 +123,8 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
 }
 
 export async function uploadSave(file: File): Promise<UploadResponse> {
-  const formData = new FormData();
-  formData.append('file', file);
+  // The backend reads the raw request body as the .sav (ZIP) bytes - no
+  // multipart encoding. Keep the raw File as the body.
   return request<UploadResponse>(baseUrl('api/upload'), {
     method: 'POST',
     body: file,

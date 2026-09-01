@@ -1,30 +1,47 @@
 """
 Stellaris Save File Parser - HTTP Service
 Provides REST API for parsing, viewing, and modifying Stellaris .sav files.
-Optimization: uses save_splitter.py to pre-split gamestate into per-country/
-per-species files, so GET/PUT per-entity operations work on ~300KB instead
-of 44MB. No full re-parse after modifications.
+
+Optimization: uses save_splitter.py to pre-split gamestate into per-entity
+files (country / species_db / fleet / leaders / galactic_object, see
+save_splitter.DEFAULT_SPLIT_BLOCKS), so GET/PUT per-entity operations work
+on ~20-300KB split files instead of the 44MB gamestate, with O(1) char-offset
+splices back into the master text.
+
+Upload pipeline:
+  1. unzip meta + gamestate                     (~2s)
+  2. pre-split gamestate into per-entity files  (~2s)
+  3. respond immediately with meta + split info
+  4. full gamestate parse continues in a background thread (for endpoints
+     that need global data: /api/countries, /api/species)
+
+Endpoints that only need per-entity data (resources / stats / events / flag)
+read split files and never wait for the full parse.
+
+Threading: ThreadingHTTPServer + a global state lock. The background parse
+thread never holds the lock while parsing (see _start_background_parse).
 """
 
 import os
 import sys
 import json
+import re
 import zipfile
 import tempfile
-import re
+import threading
 import traceback
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 from clausewitz_parser import parse_clausewitz
 from save_splitter import (
     split_gamestate, read_split_file, write_split_file,
     splice_into_gamestate, update_parsed_sub_block,
-    cleanup_work_dir,
+    cleanup_work_dir, verify_roundtrip,
 )
 
 
-# In-memory save data store
+# In-memory save data store (guarded by _state_lock)
 save_state = {
     'sav_path': None,
     'meta_text': None,
@@ -35,7 +52,14 @@ save_state = {
     'work_dir': None,
     'manifest': None,
     'country_parsed_cache': {},  # {country_id_str: parsed_dict}
+    # Player country id, resolved fast at upload time (small-window parse)
+    'player_country_id': 0,
+    # Background full-parse bookkeeping
+    'parse_thread': None,
+    'generation': 0,
 }
+
+_state_lock = threading.RLock()
 
 
 RESOURCE_KEYS = [
@@ -56,7 +80,7 @@ RESOURCE_LABELS = {
     'unity': '凝聚力',
     'consumer_goods': '消费品',
     'alloys': '合金',
-    'volatile_motes': '易爆微粒',
+    'volatile_motes': '挥发性微粒',
     'exotic_gases': '异星气体',
     'rare_crystals': '稀有水晶',
     'sr_dark_matter': '暗物质',
@@ -143,18 +167,111 @@ def extract_save(filepath):
     return meta_text, gamestate_text
 
 
-def find_player_country_id(gamestate):
-    """Find the player's country index."""
-    player = gamestate.get('player')
-    if not player:
+def _extract_player_country(player_block):
+    """Player country id from a parsed player block value."""
+    if not player_block:
         return 0
-    if isinstance(player, dict):
-        items = player.get(None, [])
-        if items and isinstance(items, list) and len(items) > 0:
+    if isinstance(player_block, dict):
+        items = player_block.get(None, [])
+        if items and isinstance(items, list):
             first = items[0]
             if isinstance(first, dict) and 'country' in first:
-                return int(first['country'])
+                try:
+                    return int(first['country'])
+                except (ValueError, TypeError):
+                    return 0
     return 0
+
+
+def find_player_country_id(gamestate):
+    """Find the player's country index from a fully parsed gamestate."""
+    return _extract_player_country(gamestate.get('player'))
+
+
+def find_player_country_id_in_text(gs_text, window=4000):
+    """
+    Fast player-country lookup WITHOUT a full 44MB parse.
+    The `player={...}` block sits near the top of the gamestate and is tiny,
+    so parsing a small window is enough.
+    """
+    m = re.search(r'^player=\{', gs_text, re.MULTILINE)
+    if not m:
+        return 0
+    snippet = gs_text[m.start():m.start() + window]
+    try:
+        parsed = parse_clausewitz(snippet)
+        return _extract_player_country(parsed.get('player'))
+    except Exception:
+        return 0
+
+
+def get_top_level_scalar(gs_text, key):
+    """
+    Fast top-level scalar lookup. Top-level lines are NOT indented, so the
+    ^anchor (MULTILINE) only matches them, never nested occurrences.
+    Returns the raw string value or None.
+    """
+    m = re.search(rf'^{re.escape(key)}=(?:"([^"\r\n]*)"|(\S+))', gs_text,
+                  re.MULTILINE)
+    if not m:
+        return None
+    return m.group(1) if m.group(1) is not None else m.group(2)
+
+
+def _start_background_parse(generation, gs_text):
+    """
+    Parse the full gamestate in a daemon thread; commit the result only if
+    the save state is still the same generation AND the master text object
+    is unchanged (splices replace the string object, so identity is a cheap
+    staleness check). Never holds the state lock while parsing.
+    """
+    def worker():
+        try:
+            print('[PARSE-BG] Background full gamestate parse started...')
+            parsed = parse_clausewitz(gs_text)
+            print('[PARSE-BG] Full parse complete')
+        except Exception as e:
+            print(f'[PARSE-BG] Full parse failed: {e}')
+            traceback.print_exc()
+            parsed = {}
+        with _state_lock:
+            if (save_state['generation'] == generation
+                    and save_state['gamestate_text'] is gs_text):
+                save_state['gamestate_parsed'] = parsed
+            else:
+                print('[PARSE-BG] Stale result discarded (state changed)')
+
+    t = threading.Thread(target=worker, daemon=True, name='bg-full-parse')
+    save_state['parse_thread'] = t
+    t.start()
+
+
+def _wait_for_parse(timeout=150):
+    """
+    Ensure the full gamestate parse is available.
+    Joins the background thread; if the result was discarded (state changed
+    mid-parse) or never started, restarts the parse and waits once more.
+    Never holds the state lock while joining - the worker needs it to commit.
+    """
+    t = save_state.get('parse_thread')
+    if t and t.is_alive():
+        t.join(timeout)
+
+    if save_state.get('gamestate_parsed') or not save_state.get('gamestate_text'):
+        return save_state.get('gamestate_parsed')
+
+    # Result was discarded or never started: restart under the lock.
+    with _state_lock:
+        t = save_state.get('parse_thread')
+        if ((not t or not t.is_alive())
+                and not save_state.get('gamestate_parsed')
+                and save_state.get('gamestate_text')):
+            _start_background_parse(save_state['generation'],
+                                    save_state['gamestate_text'])
+    t = save_state.get('parse_thread')
+    if t and t.is_alive():
+        t.join(timeout)
+    return save_state.get('gamestate_parsed')
 
 
 def _get_country_parsed(country_idx):
@@ -170,7 +287,7 @@ def _get_country_parsed(country_idx):
     if cid_str in save_state['country_parsed_cache']:
         return save_state['country_parsed_cache'][cid_str]
 
-    # Try split file
+    # Try split file (fast: ~20-300KB instead of 44MB)
     if manifest and work_dir:
         text = read_split_file(work_dir, manifest, 'country', cid_str)
         if text:
@@ -308,7 +425,7 @@ def get_tech_count(country_idx):
 
 
 # ============ TEXT MODIFICATION FUNCTIONS ============
-# These operate on SPLIT FILE text (small, ~300KB) instead of full 44MB.
+# These operate on SPLIT FILE text (small, ~20-300KB) instead of full 44MB.
 
 
 def modify_resource_in_text(text, country_idx, resource_key, new_value):
@@ -326,9 +443,8 @@ def modify_resource_in_text(text, country_idx, resource_key, new_value):
             result_lines.append(line)
             continue
 
-        stripped = line.strip()
-        opens = stripped.count('{')
-        closes = stripped.count('}')
+        opens = line.count('{')
+        closes = line.count('}')
 
         if state == 'seeking_econ':
             if re.match(r'^\s*standard_economy_module\s*=\{\s*$', line):
@@ -373,7 +489,7 @@ def modify_resource_in_text(text, country_idx, resource_key, new_value):
 
 
 def modify_date_in_text(text, new_date):
-    """Modify the game date in text."""
+    """Modify the game date in text (top-level date= line)."""
     pattern = re.compile(r'^(date=")\d{4}\.\d{2}\.\d{2}(")', re.MULTILINE)
     return pattern.sub(f'\\g<1>{new_date}\\g<2>', text, count=1)
 
@@ -401,9 +517,8 @@ def get_delayed_events_from_text(text):
     current_evt = {}
 
     for line in lines:
-        stripped = line.strip()
-        opens = stripped.count('{')
-        closes = stripped.count('}')
+        opens = line.count('{')
+        closes = line.count('}')
 
         if state == 'seeking_event_module':
             if re.match(r'^\s*standard_event_module\s*=\{\s*$', line):
@@ -452,9 +567,8 @@ def modify_event_days_in_text(text, event_index, new_days):
         if modified:
             result_lines.append(line)
             continue
-        stripped = line.strip()
-        opens = stripped.count('{')
-        closes = stripped.count('}')
+        opens = line.count('{')
+        closes = line.count('}')
 
         if state == 'seeking_event_module':
             if re.match(r'^\s*standard_event_module\s*=\{\s*$', line):
@@ -515,104 +629,11 @@ def get_flag_from_parsed(country):
     }
 
 
-def modify_flag_in_text(text, flag_data):
-    """Modify flag data in a country's split file text.
-    
-    flag_data = {
-        icon_category, icon_file, bg_category, bg_file, colors: [c1, c2, c3, c4]
-    }
-    """
-    lines = text.split('\n')
-    state = 'seeking_flag'
-    flag_depth = 0
-    result_lines = []
-    in_colors = False
-    colors_depth = 0
-    colors_emitted = False
-    icon_done = False
-    bg_done = False
-
-    for line in lines:
-        stripped = line.strip()
-        opens = stripped.count('{')
-        closes = stripped.count('}')
-
-        if state == 'seeking_flag':
-            if re.match(r'^\s*flag=\{\s*$', line):
-                state = 'in_flag'
-                flag_depth = 1
-            result_lines.append(line)
-            continue
-
-        if state == 'in_flag':
-            flag_depth += opens - closes
-
-            # Track colors block
-            if in_colors:
-                colors_depth += opens - closes
-                if colors_depth <= 0:
-                    in_colors = False
-                # Skip original color lines (we'll emit our own)
-                continue
-
-            # Check for colors={
-            if re.match(r'^\s*colors=\{\s*$', line):
-                colors = flag_data.get('colors', [])
-                indent = line[:len(line) - len(line.lstrip())]
-                # Emit the colors block with new values
-                result_lines.append(f'{indent}colors={{')
-                for c in colors:
-                    result_lines.append(f'{indent}\t"{c}"')
-                result_lines.append(f'{indent}}}')
-                colors_emitted = True
-                in_colors = True
-                colors_depth = opens - closes
-                if colors_depth <= 0:
-                    in_colors = False
-                continue
-
-            # Modify icon
-            if not icon_done and re.match(r'^\s*icon=\{\s*$', line):
-                indent = line[:len(line) - len(line.lstrip())]
-                result_lines.append(f'{indent}icon={{')
-                result_lines.append(f'{indent}\tcategory="{flag_data.get("icon_category", "")}"')
-                result_lines.append(f'{indent}\tfile="{flag_data.get("icon_file", "")}"')
-                # Skip original icon content until depth returns to flag+1
-                icon_done = True
-                # We need to skip lines until the closing } of icon
-                # The depth tracking will handle this - we're at flag_depth + opens already
-                # But we already added the opens to flag_depth... let me handle differently
-                # Actually let me use a sub-state approach
-                result_lines.append(line)  # keep the original line too for now
-                continue
-
-            # Modify background
-            if not bg_done and re.match(r'^\s*background=\{\s*$', line):
-                indent = line[:len(line) - len(line.lstrip())]
-                result_lines.append(f'{indent}background={{')
-                result_lines.append(f'{indent}\tcategory="{flag_data.get("bg_category", "")}"')
-                result_lines.append(f'{indent}\tfile="{flag_data.get("bg_file", "")}"')
-                bg_done = True
-                # Same issue with skipping original content
-                result_lines.append(line)
-                continue
-
-            if flag_depth <= 0:
-                state = 'done'
-
-            result_lines.append(line)
-            continue
-
-        result_lines.append(line)
-
-    return '\n'.join(result_lines)
-
-
 def modify_flag_in_text_v2(text, flag_data):
-    """Simpler flag modification: use regex to replace specific fields.
-    
-    This replaces the first occurrence of each flag field within the flag={...} block.
-    Works on the country's split file text (small).
+    """Rebuild the flag={...} block inside a country's split file text.
+
+    Uses the ORIGINAL leading indentation of the flag block so the splice
+    stays as byte-close to the source formatting as possible.
     """
     # Find the flag block boundaries
     lines = text.split('\n')
@@ -620,21 +641,23 @@ def modify_flag_in_text_v2(text, flag_data):
     flag_end = -1
     depth = 0
     for i, line in enumerate(lines):
-        if re.match(r'^\s*flag=\{\s*$', line):
-            flag_start = i
-            depth = 1
+        if flag_start < 0:
+            if re.match(r'^\s*flag=\{\s*$', line):
+                flag_start = i
+                depth = 1
             continue
-        if flag_start >= 0:
-            depth += line.count('{') - line.count('}')
-            if depth <= 0:
-                flag_end = i
-                break
+        depth += line.count('{') - line.count('}')
+        if depth <= 0:
+            flag_end = i
+            break
 
     if flag_start < 0 or flag_end < 0:
         return text
 
-    # Rebuild the flag block
-    indent = '\t'
+    # Preserve the original indentation of the flag= line
+    first = lines[flag_start]
+    indent = first[:len(first) - len(first.lstrip())]
+
     icon_cat = flag_data.get('icon_category', '')
     icon_file = flag_data.get('icon_file', '')
     bg_cat = flag_data.get('bg_category', '')
@@ -656,7 +679,6 @@ def modify_flag_in_text_v2(text, flag_data):
     new_flag_lines.append(f'{indent}\t}}')
     new_flag_lines.append(f'{indent}}}')
 
-    # Replace lines[flag_start:flag_end+1] with new_flag_lines
     result_lines = lines[:flag_start] + new_flag_lines + lines[flag_end + 1:]
     return '\n'.join(result_lines)
 
@@ -690,12 +712,12 @@ def _modify_and_splice(country_idx, modify_fn, *args):
     # Write back to split file
     write_split_file(work_dir, manifest, 'country', cid_str, new_text)
 
-    # Splice into full gamestate
+    # Splice into full gamestate (O(1) via char offsets)
     save_state['gamestate_text'] = splice_into_gamestate(
         save_state['gamestate_text'], manifest, 'country', cid_str, new_text
     )
 
-    # Update parsed cache
+    # Update parsed caches
     _invalidate_country_cache(country_idx)
     parsed = parse_clausewitz(new_text)
     country_data = parsed.get(cid_str, parsed)
@@ -723,7 +745,10 @@ def _cleanup_all():
         'work_dir': None,
         'manifest': None,
         'country_parsed_cache': {},
+        'player_country_id': 0,
+        'parse_thread': None,
     })
+    save_state['generation'] += 1
 
 
 class SaveHandler(BaseHTTPRequestHandler):
@@ -775,17 +800,22 @@ class SaveHandler(BaseHTTPRequestHandler):
 
         try:
             if path == '/api/status':
-                loaded = save_state['sav_path'] is not None
-                self._send_json({
-                    'loaded': loaded,
-                    'filename': os.path.basename(save_state['sav_path']) if loaded else None,
-                })
+                with _state_lock:
+                    loaded = save_state['sav_path'] is not None
+                    payload = {
+                        'loaded': loaded,
+                        'filename': os.path.basename(save_state['sav_path']) if loaded else None,
+                        'parsing': bool(save_state.get('parse_thread')
+                                        and save_state['parse_thread'].is_alive()),
+                    }
+                self._send_json(payload)
 
             elif path == '/api/meta':
-                if not save_state['meta_parsed']:
-                    self._send_json({'error': 'No save file loaded'}, 400)
-                    return
-                meta = save_state['meta_parsed']
+                with _state_lock:
+                    if not save_state['meta_parsed']:
+                        self._send_json({'error': 'No save file loaded'}, 400)
+                        return
+                    meta = save_state['meta_parsed']
                 dlcs = meta.get('required_dlcs', {})
                 if isinstance(dlcs, dict):
                     dlcs = dlcs.get(None, [])
@@ -802,11 +832,20 @@ class SaveHandler(BaseHTTPRequestHandler):
                 })
 
             elif path == '/api/countries':
-                if not save_state['gamestate_parsed']:
+                # Needs global data: ensure the full parse is available.
+                with _state_lock:
+                    has_save = bool(save_state['gamestate_text'])
+                if not has_save:
                     self._send_json({'error': 'No save file loaded'}, 400)
                     return
-                countries = get_countries_list(save_state['gamestate_parsed'])
-                player_idx = find_player_country_id(save_state['gamestate_parsed'])
+                gs = _wait_for_parse()
+                if not gs:
+                    self._send_json({'error': '全量解析尚未完成，请稍后重试'}, 503)
+                    return
+                with _state_lock:
+                    gs = save_state['gamestate_parsed']
+                    countries = get_countries_list(gs) if gs else []
+                    player_idx = save_state['player_country_id']
                 self._send_json({
                     'countries': countries,
                     'player_country_id': str(player_idx),
@@ -814,8 +853,9 @@ class SaveHandler(BaseHTTPRequestHandler):
 
             elif path == '/api/resources':
                 country_id = params.get('country_id', ['0'])[0]
-                resources = get_country_resources(int(country_id))
-                budget = get_budget_info(int(country_id))
+                with _state_lock:
+                    resources = get_country_resources(int(country_id))
+                    budget = get_budget_info(int(country_id))
                 labeled = {}
                 for key in RESOURCE_KEYS:
                     val = resources.get(key, 0)
@@ -832,33 +872,43 @@ class SaveHandler(BaseHTTPRequestHandler):
                 })
 
             elif path == '/api/species':
-                if not save_state['gamestate_parsed']:
+                with _state_lock:
+                    has_save = bool(save_state['gamestate_text'])
+                if not has_save:
                     self._send_json({'error': 'No save file loaded'}, 400)
                     return
-                species_db = save_state['gamestate_parsed'].get('species_db', {})
-                total = len(species_db) if isinstance(species_db, dict) else 0
-                species = get_species_list(save_state['gamestate_parsed'], limit=50)
+                gs = _wait_for_parse()
+                if not gs:
+                    self._send_json({'error': '全量解析尚未完成，请稍后重试'}, 503)
+                    return
+                with _state_lock:
+                    gs = save_state['gamestate_parsed']
+                    species_db = gs.get('species_db', {}) if isinstance(gs, dict) else {}
+                    total = len(species_db) if isinstance(species_db, dict) else 0
+                    species = get_species_list(gs, limit=50) if gs else []
                 self._send_json({'species': species, 'total': total})
 
             elif path == '/api/events':
-                if not save_state['gamestate_text']:
-                    self._send_json({'error': 'No save file loaded'}, 400)
-                    return
-                country_id = int(params.get('country_id', [0])[0])
-                # Use split file for fast extraction
-                cid_str = str(country_id)
-                work_dir = save_state['work_dir']
-                manifest = save_state['manifest']
-                if work_dir and manifest:
-                    text = read_split_file(work_dir, manifest, 'country', cid_str)
-                else:
-                    text = save_state['gamestate_text']
+                with _state_lock:
+                    if not save_state['gamestate_text']:
+                        self._send_json({'error': 'No save file loaded'}, 400)
+                        return
+                    country_id = int(params.get('country_id', ['0'])[0])
+                    # Use split file for fast extraction
+                    cid_str = str(country_id)
+                    work_dir = save_state['work_dir']
+                    manifest = save_state['manifest']
+                    if work_dir and manifest:
+                        text = read_split_file(work_dir, manifest, 'country', cid_str)
+                    else:
+                        text = save_state['gamestate_text']
                 events = get_delayed_events_from_text(text) if text else []
                 self._send_json({'events': events, 'country_id': str(country_id)})
 
             elif path == '/api/flag':
-                country_id = int(params.get('country_id', [0])[0])
-                country = _get_country_parsed(country_id)
+                country_id = int(params.get('country_id', ['0'])[0])
+                with _state_lock:
+                    country = _get_country_parsed(country_id)
                 flag = get_flag_from_parsed(country)
                 self._send_json({
                     'flag': flag,
@@ -869,32 +919,56 @@ class SaveHandler(BaseHTTPRequestHandler):
                 })
 
             elif path == '/api/date':
-                if not save_state['gamestate_parsed']:
-                    self._send_json({'error': 'No save file loaded'}, 400)
-                    return
-                date = save_state['gamestate_parsed'].get('date', '')
-                self._send_json({'date': date})
+                with _state_lock:
+                    if not save_state['gamestate_text']:
+                        self._send_json({'error': 'No save file loaded'}, 400)
+                        return
+                    date = get_top_level_scalar(save_state['gamestate_text'], 'date')
+                self._send_json({'date': date or ''})
 
             elif path == '/api/stats':
-                if not save_state['gamestate_parsed']:
-                    self._send_json({'error': 'No save file loaded'}, 400)
-                    return
-                gs = save_state['gamestate_parsed']
-                player_idx = find_player_country_id(gs)
-                countries = gs.get('country', {})
-                c_key = str(player_idx)
-                country = countries.get(c_key, {}) if isinstance(countries, dict) else {}
+                # Split-first: works BEFORE the background full parse finishes.
+                with _state_lock:
+                    gs_text = save_state['gamestate_text']
+                    if not gs_text:
+                        self._send_json({'error': 'No save file loaded'}, 400)
+                        return
+                    manifest = save_state['manifest']
+                    player_idx = save_state['player_country_id']
+                    country = _get_country_parsed(player_idx)
+                    tech_count = get_tech_count(player_idx)
+
+                date = get_top_level_scalar(gs_text, 'date') or ''
+                tick_raw = get_top_level_scalar(gs_text, 'tick')
+                try:
+                    tick = int(tick_raw) if tick_raw is not None else 0
+                except (ValueError, TypeError):
+                    tick = 0
+
+                if manifest:
+                    num_countries = len(manifest.get('sub_ranges', {}).get('country', {}))
+                    num_species = len(manifest.get('sub_ranges', {}).get('species_db', {}))
+                else:
+                    # No split available: fall back to the full parse (which is
+                    # synchronous in the no-split upload path).
+                    gs = save_state['gamestate_parsed']
+                    countries_d = gs.get('country', {}) if isinstance(gs, dict) else {}
+                    species_d = gs.get('species_db', {}) if isinstance(gs, dict) else {}
+                    num_countries = len(countries_d) if isinstance(countries_d, dict) else 0
+                    num_species = len(species_d) if isinstance(species_d, dict) else 0
+
+                owned_planets = country.get('owned_planets', {}) if isinstance(country, dict) else {}
                 self._send_json({
-                    'date': gs.get('date', ''),
-                    'tick': gs.get('tick', 0),
-                    'num_species': len(gs.get('species_db', {})) if isinstance(gs.get('species_db'), dict) else 0,
-                    'num_countries': len(countries) if isinstance(countries, dict) else 0,
+                    'date': date,
+                    'tick': tick,
+                    'num_species': num_species,
+                    'num_countries': num_countries,
                     'player_country_id': str(player_idx),
-                    'tech_count': get_tech_count(player_idx),
+                    'tech_count': tech_count,
                     'fleet_size': country.get('fleet_size', 0) if isinstance(country, dict) else 0,
                     'military_power': float(country.get('military_power', 0)) if isinstance(country, dict) else 0,
                     'empire_size': country.get('empire_size', 0) if isinstance(country, dict) else 0,
-                    'owned_planets_count': len(country.get('owned_planets', {}).get(None, [])) if isinstance(country, dict) else 0,
+                    'owned_planets_count': len(owned_planets.get(None, [])) if isinstance(owned_planets, dict) else 0,
                 })
 
             else:
@@ -915,69 +989,81 @@ class SaveHandler(BaseHTTPRequestHandler):
                     self._send_json({'error': 'No file data'}, 400)
                     return
 
-                # Clean up any previous state
-                _cleanup_all()
+                with _state_lock:
+                    # Clean up any previous state
+                    _cleanup_all()
 
-                # Save to temp file
-                tmp = tempfile.NamedTemporaryFile(suffix='.sav', delete=False)
-                tmp.write(body)
-                tmp.close()
+                    # Save to temp file
+                    tmp = tempfile.NamedTemporaryFile(suffix='.sav', delete=False)
+                    tmp.write(body)
+                    tmp.close()
 
-                try:
-                    meta_text, gamestate_text = extract_save(tmp.name)
-                except Exception as e:
-                    os.unlink(tmp.name)
-                    self._send_json({'error': f'Failed to parse .sav file: {str(e)}'}, 400)
-                    return
+                    try:
+                        meta_text, gamestate_text = extract_save(tmp.name)
+                    except Exception as e:
+                        os.unlink(tmp.name)
+                        self._send_json({'error': f'Failed to parse .sav file: {str(e)}'}, 400)
+                        return
 
-                meta_parsed = parse_clausewitz(meta_text) if meta_text else {}
+                    meta_parsed = parse_clausewitz(meta_text) if meta_text else {}
 
-                # Full parse of gamestate (needed for global data like countries list)
-                gamestate_parsed = {}
-                try:
-                    print('[UPLOAD] Starting full gamestate parse...')
-                    gamestate_parsed = parse_clausewitz(gamestate_text) if gamestate_text else {}
-                    print('[UPLOAD] Full parse complete')
-                except Exception as e:
-                    print(f'[UPLOAD] Warning: Full gamestate parse failed: {e}')
+                    save_state['sav_path'] = tmp.name
+                    save_state['meta_text'] = meta_text
+                    save_state['gamestate_text'] = gamestate_text
+                    save_state['meta_parsed'] = meta_parsed
+                    save_state['country_parsed_cache'] = {}
 
-                save_state['sav_path'] = tmp.name
-                save_state['meta_text'] = meta_text
-                save_state['gamestate_text'] = gamestate_text
-                save_state['meta_parsed'] = meta_parsed
-                save_state['gamestate_parsed'] = gamestate_parsed
-                save_state['country_parsed_cache'] = {}
+                    # Fast player country lookup (small-window parse)
+                    player_idx = find_player_country_id_in_text(gamestate_text)
+                    save_state['player_country_id'] = player_idx
 
-                # Pre-split the gamestate for fast per-entity access
-                work_dir = os.path.join(os.path.dirname(tmp.name), f'stellaris_split_{os.path.basename(tmp.name)}')
-                try:
-                    print('[UPLOAD] Starting gamestate split...')
-                    manifest = split_gamestate(gamestate_text, work_dir)
-                    save_state['work_dir'] = work_dir
-                    save_state['manifest'] = manifest
-                    print('[UPLOAD] Split complete')
-                except Exception as e:
-                    print(f'[UPLOAD] Warning: Split failed: {e}')
-                    traceback.print_exc()
-                    # Continue without split - will fall back to full text
-                    save_state['work_dir'] = None
-                    save_state['manifest'] = None
+                    # Pre-split the gamestate for fast per-entity access.
+                    # Falls back gracefully if splitting fails.
+                    work_dir = os.path.join(
+                        os.path.dirname(tmp.name),
+                        f'stellaris_split_{os.path.basename(tmp.name)}')
+                    try:
+                        print('[UPLOAD] Starting gamestate split...')
+                        manifest = split_gamestate(gamestate_text, work_dir)
+                        save_state['work_dir'] = work_dir
+                        save_state['manifest'] = manifest
+                        print('[UPLOAD] Split complete')
+                        if os.environ.get('SAVE_VERIFY') == '1':
+                            ok = verify_roundtrip(gamestate_text, manifest, work_dir)
+                            print(f'[UPLOAD] Roundtrip verify: {"PASS" if ok else "FAIL"}')
+                    except Exception as e:
+                        print(f'[UPLOAD] Warning: Split failed: {e}')
+                        traceback.print_exc()
+                        save_state['work_dir'] = None
+                        save_state['manifest'] = None
 
-                player_idx = find_player_country_id(gamestate_parsed)
-                meta_name = meta_parsed.get('name', '')
-                meta_date = meta_parsed.get('date', '')
+                    if save_state['manifest']:
+                        # Split succeeded: full parse can run in the
+                        # background - the response goes out NOW.
+                        _start_background_parse(save_state['generation'],
+                                                gamestate_text)
+                        gamestate_parsed = None
+                    else:
+                        # No split: parse synchronously (old behaviour)
+                        print('[UPLOAD] Starting full gamestate parse...')
+                        gamestate_parsed = parse_clausewitz(gamestate_text) if gamestate_text else {}
+                        print('[UPLOAD] Full parse complete')
+                        save_state['gamestate_parsed'] = gamestate_parsed
 
-                dlcs = meta_parsed.get('required_dlcs', {})
-                if isinstance(dlcs, dict):
-                    dlcs = dlcs.get(None, [])
-                if not isinstance(dlcs, list):
-                    dlcs = [dlcs]
+                    meta_name = meta_parsed.get('name', '')
+                    meta_date = meta_parsed.get('date', '')
 
-                # Report split info
-                split_info = {}
-                if save_state['manifest']:
-                    for bname, info in save_state['manifest'].get('split_info', {}).items():
-                        split_info[bname] = len(info)
+                    dlcs = meta_parsed.get('required_dlcs', {})
+                    if isinstance(dlcs, dict):
+                        dlcs = dlcs.get(None, [])
+                    if not isinstance(dlcs, list):
+                        dlcs = [dlcs]
+
+                    # Report split info
+                    split_info = {}
+                    if save_state['manifest']:
+                        for bname, info in save_state['manifest'].get('split_info', {}).items():
+                            split_info[bname] = len(info)
 
                 self._send_json({
                     'success': True,
@@ -994,19 +1080,23 @@ class SaveHandler(BaseHTTPRequestHandler):
                     'player_country_id': str(player_idx),
                     'gamestate_size': len(gamestate_text),
                     'split_info': split_info,
+                    'background_parse': bool(save_state.get('parse_thread')),
                 })
 
             elif path == '/api/export':
-                if not save_state['sav_path']:
-                    self._send_json({'error': 'No save file loaded'}, 400)
-                    return
+                with _state_lock:
+                    if not save_state['sav_path']:
+                        self._send_json({'error': 'No save file loaded'}, 400)
+                        return
+                    meta_text = save_state['meta_text']
+                    gamestate_text = save_state['gamestate_text']
 
                 export_tmp = tempfile.NamedTemporaryFile(suffix='.sav', delete=False)
                 export_tmp.close()
 
                 with zipfile.ZipFile(export_tmp.name, 'w', zipfile.ZIP_DEFLATED) as zout:
-                    zout.writestr('meta', save_state['meta_text'].encode('utf-8'))
-                    zout.writestr('gamestate', save_state['gamestate_text'].encode('utf-8'))
+                    zout.writestr('meta', meta_text.encode('utf-8'))
+                    zout.writestr('gamestate', gamestate_text.encode('utf-8'))
 
                 self._send_file(export_tmp.name, 'modified_save.sav')
                 os.unlink(export_tmp.name)
@@ -1026,98 +1116,103 @@ class SaveHandler(BaseHTTPRequestHandler):
             body = self._read_body()
             data = json.loads(body) if body else {}
 
-            if path == '/api/resources':
-                country_id = data.get('country_id', 0)
-                resources = data.get('resources', {})
+            with _state_lock:
+                if path == '/api/resources':
+                    country_id = data.get('country_id', 0)
+                    resources = data.get('resources', {})
 
-                # Use split-based modification
-                if save_state['work_dir'] and save_state['manifest']:
-                    for key, value in resources.items():
-                        try:
-                            _modify_and_splice(
-                                country_id, modify_resource_in_text,
-                                int(country_id), key, float(value)
-                            )
-                        except (ValueError, TypeError) as e:
-                            print(f'[PUT] Resource {key} modification error: {e}')
-                    self._send_json({'success': True, 'message': f'Updated {len(resources)} resources'})
+                    # Use split-based modification
+                    if save_state['work_dir'] and save_state['manifest']:
+                        for key, value in resources.items():
+                            try:
+                                _modify_and_splice(
+                                    country_id, modify_resource_in_text,
+                                    int(country_id), key, float(value)
+                                )
+                            except (ValueError, TypeError) as e:
+                                print(f'[PUT] Resource {key} modification error: {e}')
+                        self._send_json({'success': True, 'message': f'Updated {len(resources)} resources'})
+                    else:
+                        # Fallback: modify full text (slow)
+                        gs_text = save_state['gamestate_text']
+                        for key, value in resources.items():
+                            try:
+                                gs_text = modify_resource_in_text(gs_text, int(country_id), key, float(value))
+                            except (ValueError, TypeError):
+                                pass
+                        save_state['gamestate_text'] = gs_text
+                        self._send_json({'success': True, 'message': f'Updated {len(resources)} resources'})
+
+                elif path == '/api/date':
+                    new_date = data.get('date', '')
+                    if not re.match(r'^\d{4}\.\d{2}\.\d{2}$', new_date):
+                        self._send_json({'error': 'Invalid date format, use YYYY.MM.DD'}, 400)
+                        return
+
+                    save_state['gamestate_text'] = modify_date_in_text(save_state['gamestate_text'], new_date)
+                    save_state['meta_text'] = modify_date_in_text(save_state['meta_text'], new_date)
+                    # Keep derived structures in sync (cheap)
+                    try:
+                        save_state['meta_parsed'] = parse_clausewitz(save_state['meta_text'])
+                    except Exception:
+                        pass
+                    if isinstance(save_state.get('gamestate_parsed'), dict):
+                        save_state['gamestate_parsed']['date'] = new_date
+                    self._send_json({'success': True, 'date': new_date})
+
+                elif path == '/api/name':
+                    new_name = data.get('name', '')
+                    old_name = save_state['meta_parsed'].get('name', '') if save_state['meta_parsed'] else ''
+
+                    # Modify in full gamestate_text (name is at top level, not in split blocks)
+                    if old_name:
+                        save_state['gamestate_text'] = modify_name_in_text(save_state['gamestate_text'], old_name, new_name)
+                    save_state['meta_text'] = modify_name_in_meta(save_state['meta_text'], new_name)
+                    try:
+                        save_state['meta_parsed'] = parse_clausewitz(save_state['meta_text'])
+                    except Exception:
+                        pass
+                    if isinstance(save_state.get('gamestate_parsed'), dict):
+                        save_state['gamestate_parsed'].pop('name', None)
+                    self._send_json({'success': True, 'name': new_name})
+
+                elif path == '/api/events':
+                    country_id = int(data.get('country_id', 0))
+                    event_changes = data.get('events', [])
+
+                    if save_state['work_dir'] and save_state['manifest']:
+                        for change in event_changes:
+                            evt_idx = change.get('index', -1)
+                            new_days = change.get('days', 0)
+                            if evt_idx >= 0:
+                                _modify_and_splice(
+                                    country_id, modify_event_days_in_text,
+                                    evt_idx, int(new_days)
+                                )
+                        self._send_json({'success': True, 'message': f'Updated {len(event_changes)} events'})
+                    else:
+                        gs_text = save_state['gamestate_text']
+                        for change in event_changes:
+                            evt_idx = change.get('index', -1)
+                            new_days = change.get('days', 0)
+                            if evt_idx >= 0:
+                                gs_text = modify_event_days_in_text(gs_text, country_id, evt_idx, int(new_days))
+                        save_state['gamestate_text'] = gs_text
+                        self._send_json({'success': True, 'message': f'Updated {len(event_changes)} events'})
+
+                elif path == '/api/flag':
+                    country_id = int(data.get('country_id', 0))
+                    flag_data = data.get('flag', {})
+
+                    if save_state['work_dir'] and save_state['manifest']:
+                        _modify_and_splice(country_id, modify_flag_in_text_v2, flag_data)
+                        self._send_json({'success': True, 'message': 'Flag updated'})
+                    else:
+                        save_state['gamestate_text'] = modify_flag_in_text_v2(save_state['gamestate_text'], flag_data)
+                        self._send_json({'success': True, 'message': 'Flag updated'})
+
                 else:
-                    # Fallback: modify full text (slow)
-                    gs_text = save_state['gamestate_text']
-                    for key, value in resources.items():
-                        try:
-                            gs_text = modify_resource_in_text(gs_text, int(country_id), key, float(value))
-                        except (ValueError, TypeError):
-                            pass
-                    save_state['gamestate_text'] = gs_text
-                    self._send_json({'success': True, 'message': f'Updated {len(resources)} resources'})
-
-            elif path == '/api/date':
-                new_date = data.get('date', '')
-                if not re.match(r'^\d{4}\.\d{2}\.\d{2}$', new_date):
-                    self._send_json({'error': 'Invalid date format, use YYYY.MM.DD'}, 400)
-                    return
-
-                save_state['gamestate_text'] = modify_date_in_text(save_state['gamestate_text'], new_date)
-                save_state['meta_text'] = modify_date_in_text(save_state['meta_text'], new_date)
-                # Date is top-level, no split needed; quick re-parse of meta only
-                try:
-                    save_state['meta_parsed'] = parse_clausewitz(save_state['meta_text'])
-                except:
-                    pass
-                self._send_json({'success': True, 'date': new_date})
-
-            elif path == '/api/name':
-                new_name = data.get('name', '')
-                old_name = save_state['meta_parsed'].get('name', '') if save_state['meta_parsed'] else ''
-
-                # Modify in full gamestate_text (name is at top level, not in split blocks)
-                if old_name:
-                    save_state['gamestate_text'] = modify_name_in_text(save_state['gamestate_text'], old_name, new_name)
-                save_state['meta_text'] = modify_name_in_meta(save_state['meta_text'], new_name)
-                try:
-                    save_state['meta_parsed'] = parse_clausewitz(save_state['meta_text'])
-                except:
-                    pass
-                self._send_json({'success': True, 'name': new_name})
-
-            elif path == '/api/events':
-                country_id = int(data.get('country_id', 0))
-                event_changes = data.get('events', [])
-
-                if save_state['work_dir'] and save_state['manifest']:
-                    for change in event_changes:
-                        evt_idx = change.get('index', -1)
-                        new_days = change.get('days', 0)
-                        if evt_idx >= 0:
-                            _modify_and_splice(
-                                country_id, modify_event_days_in_text,
-                                evt_idx, int(new_days)
-                            )
-                    self._send_json({'success': True, 'message': f'Updated {len(event_changes)} events'})
-                else:
-                    gs_text = save_state['gamestate_text']
-                    for change in event_changes:
-                        evt_idx = change.get('index', -1)
-                        new_days = change.get('days', 0)
-                        if evt_idx >= 0:
-                            gs_text = modify_event_days_in_text(gs_text, country_id, evt_idx, int(new_days))
-                    save_state['gamestate_text'] = gs_text
-                    self._send_json({'success': True, 'message': f'Updated {len(event_changes)} events'})
-
-            elif path == '/api/flag':
-                country_id = int(data.get('country_id', 0))
-                flag_data = data.get('flag', {})
-
-                if save_state['work_dir'] and save_state['manifest']:
-                    _modify_and_splice(country_id, modify_flag_in_text_v2, flag_data)
-                    self._send_json({'success': True, 'message': 'Flag updated'})
-                else:
-                    save_state['gamestate_text'] = modify_flag_in_text_v2(save_state['gamestate_text'], country_id, flag_data)
-                    self._send_json({'success': True, 'message': 'Flag updated'})
-
-            else:
-                self._send_json({'error': 'Not found'}, 404)
+                    self._send_json({'error': 'Not found'}, 404)
 
         except Exception as e:
             traceback.print_exc()
@@ -1129,11 +1224,13 @@ class SaveHandler(BaseHTTPRequestHandler):
 
         try:
             if path == '/api/save':
-                _cleanup_all()
+                with _state_lock:
+                    _cleanup_all()
                 self._send_json({'success': True})
             else:
                 self._send_json({'error': 'Not found'}, 404)
         except Exception as e:
+            traceback.print_exc()
             self._send_json({'error': str(e)}, 500)
 
     def log_message(self, format, *args):
@@ -1141,8 +1238,10 @@ class SaveHandler(BaseHTTPRequestHandler):
 
 
 def run_server(port=3001):
-    server = HTTPServer(('0.0.0.0', port), SaveHandler)
-    print(f'Stellaris Save Parser Service running on port {port}')
+    server = ThreadingHTTPServer(('0.0.0.0', port), SaveHandler)
+    server.daemon_threads = True
+    print(f'Stellaris Save Parser Service running on port {port} '
+          f'(split blocks: {os.environ.get("SPLIT_BLOCKS", "default")})')
     try:
         server.serve_forever()
     except KeyboardInterrupt:
