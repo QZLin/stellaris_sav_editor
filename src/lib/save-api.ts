@@ -66,6 +66,8 @@ export interface FleetInfo {
   hit_points: number;
   station: boolean;
   civilian: boolean;
+  /** 'military' | 'civilian' | 'station' (station takes precedence) */
+  category: 'military' | 'civilian' | 'station';
   movement_state: string;
   coordinate: { x: number; y: number } | null;
 }

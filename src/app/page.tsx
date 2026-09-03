@@ -86,7 +86,7 @@ export default function Home() {
   const [fleetsLoading, setFleetsLoading] = useState(false);
   const [fleetsError, setFleetsError] = useState<string | null>(null);
   const [fleetQuery, setFleetQuery] = useState('');
-  const [fleetFilter, setFleetFilter] = useState<'all' | 'mobile' | 'station'>('all');
+  const [fleetFilter, setFleetFilter] = useState<'all' | 'military' | 'civilian' | 'station'>('all');
   const fileRef = useRef<HTMLInputElement>(null);
   /** Request-generation guards: discard stale async responses. */
   const countriesReqRef = useRef(0);
@@ -332,21 +332,21 @@ export default function Home() {
   const selectedCountry = countries.find((c) => c.id === selectedCountryId) ?? null;
   const isPlayerCountry = !!stats && selectedCountryId === stats.player_country_id;
 
-  // Fleet list: search + type filter (backend pre-sorts: mobile by mp
-  // desc, then stations).
+  // Fleet list: search + category filter. The list keeps the save's
+  // original owned_fleets order (backend does not re-sort).
   const filteredFleets = useMemo(() => {
     const q = fleetQuery.trim().toLowerCase();
     return fleets.filter((f) => {
-      if (fleetFilter === 'mobile' && f.station) return false;
-      if (fleetFilter === 'station' && !f.station) return false;
+      if (fleetFilter !== 'all' && f.category !== fleetFilter) return false;
       if (q && !f.name.toLowerCase().includes(q) && !f.id.includes(q)) return false;
       return true;
     });
   }, [fleets, fleetQuery, fleetFilter]);
 
   const fleetCounts = useMemo(() => ({
-    mobile: fleets.filter((f) => !f.station).length,
-    station: fleets.filter((f) => f.station).length,
+    military: fleets.filter((f) => f.category === 'military').length,
+    civilian: fleets.filter((f) => f.category === 'civilian').length,
+    station: fleets.filter((f) => f.category === 'station').length,
   }), [fleets]);
 
   if (screen === 'upload') {
@@ -510,7 +510,7 @@ export default function Home() {
                 </span>
               ) : (
                 <span className="text-xs text-muted-foreground">
-                  {fleetCounts.mobile} 舰队 / {fleetCounts.station} 空间站
+                  {fleetCounts.military} 舰队 / {fleetCounts.civilian} 民用 / {fleetCounts.station} 空间站
                 </span>
               )}
             </div>
@@ -524,8 +524,13 @@ export default function Home() {
                   onChange={(e) => setFleetQuery(e.target.value)}
                 />
               </div>
-              <div className="flex gap-1">
-                {([['all', `全部 ${fleets.length}`], ['mobile', `舰队 ${fleetCounts.mobile}`], ['station', `空间站 ${fleetCounts.station}`]] as const).map(([key, label]) => (
+              <div className="flex gap-1 flex-wrap">
+                {([
+                  ['all', `全部 ${fleets.length}`],
+                  ['military', `舰队 ${fleetCounts.military}`],
+                  ['civilian', `民用 ${fleetCounts.civilian}`],
+                  ['station', `空间站 ${fleetCounts.station}`],
+                ] as const).map(([key, label]) => (
                   <Button
                     key={key}
                     size="sm"

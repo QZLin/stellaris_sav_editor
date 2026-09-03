@@ -456,13 +456,20 @@ def get_country_fleets(country_idx):
             ships = _implicit_list(fmeta.get('ships', {}))
             mm = fmeta.get('movement_manager', {})
             coord = mm.get('coordinate', {}) if isinstance(mm, dict) else {}
+            station = bool(fmeta.get('station', False))
+            civilian = bool(fmeta.get('civilian', False))
+            # station takes precedence: starbases may also carry
+            # civilian=True in the save; a mobile fleet is civilian only
+            # if flagged so (science / construction / colony ships).
+            category = 'station' if station else ('civilian' if civilian else 'military')
             item.update({
                 'name': _fleet_display_name(fmeta.get('name', '')),
                 'ship_count': len(ships),
                 'military_power': float(fmeta.get('military_power', 0) or 0),
                 'hit_points': float(fmeta.get('hit_points', 0) or 0),
-                'station': bool(fmeta.get('station', False)),
-                'civilian': bool(fmeta.get('civilian', False)),
+                'station': station,
+                'civilian': civilian,
+                'category': category,
                 'movement_state': str(mm.get('state', '')) if isinstance(mm, dict) else '',
                 'coordinate': {
                     'x': coord.get('x', 0),
@@ -473,12 +480,12 @@ def get_country_fleets(country_idx):
             item.update({
                 'name': '', 'ship_count': 0, 'military_power': 0.0,
                 'hit_points': 0.0, 'station': False, 'civilian': False,
-                'movement_state': '', 'coordinate': None,
+                'category': 'military', 'movement_state': '',
+                'coordinate': None,
             })
         fleets.append(item)
 
-    # mobile combat fleets first (military power desc), stations last
-    fleets.sort(key=lambda f: (f['station'], -f['military_power']))
+    # Keep the original owned_fleets order from the save (no sorting)
     return fleets
 
 
