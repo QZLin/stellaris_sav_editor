@@ -57,6 +57,25 @@ export interface CountryInfo {
   fleet_size: number;
 }
 
+export interface FleetInfo {
+  id: string;
+  name: string;
+  ownership_status: string;
+  ship_count: number;
+  military_power: number;
+  hit_points: number;
+  station: boolean;
+  civilian: boolean;
+  movement_state: string;
+  coordinate: { x: number; y: number } | null;
+}
+
+export interface FleetsResponse {
+  fleets: FleetInfo[];
+  country_id: string;
+  total: number;
+}
+
 export interface SpeciesInfo {
   id: string;
   name: string;
@@ -180,6 +199,10 @@ export async function getResources(countryId: string) {
 
 export async function getCountries() {
   return request<CountriesResponse>(baseUrl('api/countries'));
+}
+
+export async function getFleets(countryId: string) {
+  return request<FleetsResponse>(baseUrl(`api/fleets?country_id=${countryId}`));
 }
 
 export async function getSpecies() {

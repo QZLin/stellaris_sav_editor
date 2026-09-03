@@ -331,6 +331,157 @@ def get_country_resources(country_idx):
     return resources if isinstance(resources, dict) else {}
 
 
+# ---- Fleet list viewer helpers ----
+
+# shipclass_* name keys -> human-readable type (for display)
+STATION_CLASS_LABELS = {
+    'shipclass_starbase_name': '星垒',
+    'shipclass_outpost_name': '前哨站',
+    'shipclass_mining_station_name': '采矿站',
+    'shipclass_research_station_name': '研究站',
+    'shipclass_watchstation_name': '哨站',
+    'shipclass_defense_platform_name': '防御平台',
+    'shipclass ion cannon_fortress_name': '离子炮平台',
+}
+
+
+def _implicit_list(value):
+    """Normalize a parser output that may hold an implicit list.
+
+    The Clausewitz parser stores lists of anonymous dicts as
+    {None: [item, ...]} (JSON: "null"). Accept a raw list, the None-key
+    wrapper, or a single dict fallback.
+    """
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        if None in value and isinstance(value[None], list):
+            return value[None]
+        return [value]
+    return []
+
+
+def _fleet_display_name(name_field):
+    """
+    Build a readable fleet name from the parsed name block.
+
+    Shapes seen in real saves:
+      {key: "shipclass_mining_station_name", variables: [ {key: "PLANET",
+        value: {key: "Sun"}} ]}            -> "Sun 采矿站"
+      {key: "HUMAN1_SHIP_India"}           -> "India"
+      {key: "HUMAN1_SHIP_India"} (station) -> unchanged key as fallback
+    """
+    if not isinstance(name_field, dict):
+        return str(name_field or '')
+    key = str(name_field.get('key', '') or '')
+    subject = ''
+    variables = _implicit_list(name_field.get('variables', {}))
+    for var in variables:
+        if not isinstance(var, dict):
+            continue
+        val = var.get('value', {})
+        if isinstance(val, dict) and val.get('key'):
+            subject = str(val['key'])
+            break
+    # NAME_Uranus -> Uranus (localization key prefix)
+    if subject.startswith('NAME_'):
+        subject = subject[5:]
+
+    class_label = ''
+    if key.startswith('shipclass_') or key in STATION_CLASS_LABELS:
+        class_label = STATION_CLASS_LABELS.get(key, '')
+        if not class_label:
+            # generic: shipclass_mining_station_name -> Mining Station
+            base = key
+            for prefix in ('shipclass_', 'shipclass'):
+                if base.startswith(prefix):
+                    base = base[len(prefix):]
+                    break
+            if base.endswith('_name'):
+                base = base[:-5]
+            class_label = base.replace('_', ' ').strip()
+        if subject:
+            return f'{subject} {class_label}'
+        return class_label
+
+    # Named fleets: HUMAN1_SHIP_India -> India (keep other keys as-is)
+    import re as _re
+    named = _re.sub(r'^HUMAN\d+_SHIP_', '', key)
+    named = _re.sub(r'^[A-Z]+_FLEET_(?=[A-Z])', '', named)
+    return named or key
+
+
+def get_country_fleets(country_idx):
+    """
+    Fleet list for a country, straight from split files.
+
+    Reads the country split file's fleets_manager.owned_fleets for fleet
+    IDs (each entry: fleet=<id> ownership_status=normal ...), then each
+    fleet split file for metadata. 307 fleets parse in ~0.1s.
+    """
+    cid_str = str(country_idx)
+    work_dir = save_state['work_dir']
+    manifest = save_state['manifest']
+
+    country = _get_country_parsed(country_idx)
+    if not isinstance(country, dict):
+        return None  # country not found
+    fm = country.get('fleets_manager', {})
+    if not isinstance(fm, dict):
+        return []
+    own = fm.get('owned_fleets', {})
+    entries = [e for e in _implicit_list(own)
+               if isinstance(e, dict) and 'fleet' in e]
+
+    fleets = []
+    for e in entries:
+        fid = str(e['fleet'])
+        item = {
+            'id': fid,
+            'ownership_status': str(e.get('ownership_status', '')),
+        }
+        # Metadata from the fleet split file (skip if not split)
+        fmeta = None
+        if manifest and work_dir:
+            ftext = read_split_file(work_dir, manifest, 'fleet', fid)
+            if ftext is not None:
+                fd = parse_clausewitz(ftext).get(fid, {})
+                if isinstance(fd, dict):
+                    fmeta = fd
+        if fmeta is None and save_state.get('gamestate_parsed'):
+            fmeta = (save_state['gamestate_parsed'].get('fleet', {})
+                     or {}).get(fid)
+
+        if isinstance(fmeta, dict):
+            ships = _implicit_list(fmeta.get('ships', {}))
+            mm = fmeta.get('movement_manager', {})
+            coord = mm.get('coordinate', {}) if isinstance(mm, dict) else {}
+            item.update({
+                'name': _fleet_display_name(fmeta.get('name', '')),
+                'ship_count': len(ships),
+                'military_power': float(fmeta.get('military_power', 0) or 0),
+                'hit_points': float(fmeta.get('hit_points', 0) or 0),
+                'station': bool(fmeta.get('station', False)),
+                'civilian': bool(fmeta.get('civilian', False)),
+                'movement_state': str(mm.get('state', '')) if isinstance(mm, dict) else '',
+                'coordinate': {
+                    'x': coord.get('x', 0),
+                    'y': coord.get('y', 0),
+                } if isinstance(coord, dict) else None,
+            })
+        else:
+            item.update({
+                'name': '', 'ship_count': 0, 'military_power': 0.0,
+                'hit_points': 0.0, 'station': False, 'civilian': False,
+                'movement_state': '', 'coordinate': None,
+            })
+        fleets.append(item)
+
+    # mobile combat fleets first (military power desc), stations last
+    fleets.sort(key=lambda f: (f['station'], -f['military_power']))
+    return fleets
+
+
 def get_countries_list(gamestate):
     """Get list of all countries with basic info."""
     countries = gamestate.get('country', {})
@@ -998,6 +1149,27 @@ class SaveHandler(BaseHTTPRequestHandler):
                     'resources': labeled,
                     'country_id': country_id,
                     'categories': RESOURCE_CATEGORIES,
+                })
+
+            elif path == '/api/fleets':
+                # Fleet list viewer: owned_fleets from the country split
+                # file, metadata from fleet split files. Split-file only,
+                # never waits for the background full parse.
+                country_id = params.get('country_id', ['0'])[0]
+                with _state_lock:
+                    has_save = bool(save_state['gamestate_text'])
+                    if has_save:
+                        fleets = get_country_fleets(int(country_id))
+                if not has_save:
+                    self._send_json({'error': 'No save file loaded'}, 400)
+                    return
+                if fleets is None:
+                    self._send_json({'error': f'国家 {country_id} 不存在'}, 400)
+                    return
+                self._send_json({
+                    'fleets': fleets,
+                    'country_id': country_id,
+                    'total': len(fleets),
                 })
 
             elif path == '/api/species':

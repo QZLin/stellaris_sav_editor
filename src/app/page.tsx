@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useRef, useEffect, useMemo } from 'react';
-import { Upload, Download, Loader2, FlaskConical, Crown } from 'lucide-react';
+import { Upload, Download, Loader2, FlaskConical, Crown, Ship, Search } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -10,11 +10,11 @@ import { Badge } from '@/components/ui/badge';
 import { Separator } from '@/components/ui/separator';
 import { useToast } from '@/hooks/use-toast';
 import {
-  uploadSave, getMeta, getStats, getResources, getCountries,
+  uploadSave, getMeta, getStats, getResources, getCountries, getFleets,
   updateResources, updateDate, updateName,
   exportSave, releaseSave, loadTestSave, getStatus,
 } from '@/lib/save-api';
-import type { SaveMeta, GameStats, ResourceInfo, ResourcesResponse, UploadResponse, CountryInfo } from '@/lib/save-api';
+import type { SaveMeta, GameStats, ResourceInfo, ResourcesResponse, UploadResponse, CountryInfo, FleetInfo } from '@/lib/save-api';
 
 type Screen = 'upload' | 'editor';
 
@@ -82,10 +82,16 @@ export default function Home() {
   const [countriesLoading, setCountriesLoading] = useState(false);
   const [countriesError, setCountriesError] = useState<string | null>(null);
   const [selectedCountryId, setSelectedCountryId] = useState('');
+  const [fleets, setFleets] = useState<FleetInfo[]>([]);
+  const [fleetsLoading, setFleetsLoading] = useState(false);
+  const [fleetsError, setFleetsError] = useState<string | null>(null);
+  const [fleetQuery, setFleetQuery] = useState('');
+  const [fleetFilter, setFleetFilter] = useState<'all' | 'mobile' | 'station'>('all');
   const fileRef = useRef<HTMLInputElement>(null);
   /** Request-generation guards: discard stale async responses. */
   const countriesReqRef = useRef(0);
   const resourcesReqRef = useRef('');
+  const fleetsReqRef = useRef('');
   const { toast } = useToast();
 
   // Detect whether the backend has a server-side test save configured
@@ -126,6 +132,25 @@ export default function Home() {
     attempt(0).catch(() => {});
   };
 
+  /** Fetch the fleet list for a country (split-file fast path). */
+  const startFleetsFetch = (countryId: string) => {
+    const reqId = countryId;
+    fleetsReqRef.current = reqId;
+    setFleetsLoading(true);
+    setFleetsError(null);
+    getFleets(countryId)
+      .then((r) => {
+        if (fleetsReqRef.current !== reqId) return; // stale
+        setFleets(r.fleets);
+        setFleetsLoading(false);
+      })
+      .catch((err: any) => {
+        if (fleetsReqRef.current !== reqId) return;
+        setFleetsError(err.message || '舰队列表加载失败');
+        setFleetsLoading(false);
+      });
+  };
+
   /** Shared post-upload flow: fetch stats + resources and enter the editor. */
   const applyUpload = async (res: UploadResponse) => {
     setFilename(res.filename);
@@ -135,6 +160,9 @@ export default function Home() {
     setSelectedCountryId(res.player_country_id);
     resourcesReqRef.current = res.player_country_id;
     setCountries([]);
+    setFleets([]);
+    setFleetQuery('');
+    setFleetFilter('all');
     const [s, r] = await Promise.all([getStats(), getResources(res.player_country_id)]);
     setStats(s);
     setResources(r.resources);
@@ -146,6 +174,8 @@ export default function Home() {
     setScreen('editor');
     // Country list arrives later (needs the background full parse).
     startCountriesFetch();
+    // Fleet list is split-file fast - load right away.
+    startFleetsFetch(res.player_country_id);
   };
 
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -177,12 +207,16 @@ export default function Home() {
     }
   };
 
-  /** Switch the edited country: refetch its resources from the backend. */
+  /** Switch the edited country: refetch its resources + fleets from the backend. */
   const handleSelectCountry = async (id: string) => {
     if (!id || id === selectedCountryId) return;
     setSelectedCountryId(id);
     resourcesReqRef.current = id;
     setEditResources({}); // clear stale inputs while loading
+    setFleets([]);
+    setFleetQuery('');
+    setFleetFilter('all');
+    startFleetsFetch(id);
     try {
       const r = await getResources(id);
       if (resourcesReqRef.current !== id) return; // user switched again
@@ -262,6 +296,7 @@ export default function Home() {
     await releaseSave();
     countriesReqRef.current++; // discard in-flight country list request
     resourcesReqRef.current = '';
+    fleetsReqRef.current = '';
     setScreen('upload');
     setMeta(null);
     setStats(null);
@@ -272,6 +307,11 @@ export default function Home() {
     setSelectedCountryId('');
     setCountriesError(null);
     setCountriesLoading(false);
+    setFleets([]);
+    setFleetsError(null);
+    setFleetsLoading(false);
+    setFleetQuery('');
+    setFleetFilter('all');
     if (fileRef.current) fileRef.current.value = '';
   };
 
@@ -291,6 +331,23 @@ export default function Home() {
 
   const selectedCountry = countries.find((c) => c.id === selectedCountryId) ?? null;
   const isPlayerCountry = !!stats && selectedCountryId === stats.player_country_id;
+
+  // Fleet list: search + type filter (backend pre-sorts: mobile by mp
+  // desc, then stations).
+  const filteredFleets = useMemo(() => {
+    const q = fleetQuery.trim().toLowerCase();
+    return fleets.filter((f) => {
+      if (fleetFilter === 'mobile' && f.station) return false;
+      if (fleetFilter === 'station' && !f.station) return false;
+      if (q && !f.name.toLowerCase().includes(q) && !f.id.includes(q)) return false;
+      return true;
+    });
+  }, [fleets, fleetQuery, fleetFilter]);
+
+  const fleetCounts = useMemo(() => ({
+    mobile: fleets.filter((f) => !f.station).length,
+    station: fleets.filter((f) => f.station).length,
+  }), [fleets]);
 
   if (screen === 'upload') {
     return (
@@ -431,6 +488,109 @@ export default function Home() {
                 <span>科技 {Math.round(selectedCountry.tech_power).toLocaleString()}</span>
                 <span>舰队 {selectedCountry.fleet_size}</span>
               </div>
+            )}
+          </CardContent>
+        </Card>
+
+        {/* Fleet list viewer */}
+        <Card>
+          <CardHeader className="pb-3">
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <div className="flex items-center gap-2">
+                <CardTitle className="text-base flex items-center gap-1.5">
+                  <Ship className="h-4 w-4" />舰队列表
+                </CardTitle>
+                {selectedCountry && (
+                  <span className="text-sm text-muted-foreground">— {selectedCountry.name}</span>
+                )}
+              </div>
+              {fleetsLoading ? (
+                <span className="text-xs text-muted-foreground flex items-center gap-1">
+                  <Loader2 className="h-3 w-3 animate-spin" />加载中…
+                </span>
+              ) : (
+                <span className="text-xs text-muted-foreground">
+                  {fleetCounts.mobile} 舰队 / {fleetCounts.station} 空间站
+                </span>
+              )}
+            </div>
+            <div className="flex items-center gap-2 flex-wrap">
+              <div className="relative flex-1 min-w-[180px]">
+                <Search className="h-3.5 w-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  className="h-8 pl-8 text-sm"
+                  placeholder="搜索舰队名称或 ID…"
+                  value={fleetQuery}
+                  onChange={(e) => setFleetQuery(e.target.value)}
+                />
+              </div>
+              <div className="flex gap-1">
+                {([['all', `全部 ${fleets.length}`], ['mobile', `舰队 ${fleetCounts.mobile}`], ['station', `空间站 ${fleetCounts.station}`]] as const).map(([key, label]) => (
+                  <Button
+                    key={key}
+                    size="sm"
+                    variant={fleetFilter === key ? 'default' : 'outline'}
+                    className="h-8 text-xs"
+                    onClick={() => setFleetFilter(key)}
+                  >
+                    {label}
+                  </Button>
+                ))}
+              </div>
+            </div>
+            {fleetsError && (
+              <p className="text-xs text-red-500">{fleetsError}</p>
+            )}
+          </CardHeader>
+          <CardContent>
+            {fleets.length > 0 ? (
+              <div className="rounded-md border max-h-96 overflow-y-auto">
+                <table className="w-full text-xs">
+                  <thead className="sticky top-0 bg-muted/95 backdrop-blur">
+                    <tr className="text-left text-muted-foreground">
+                      <th className="px-3 py-2 font-medium">名称</th>
+                      <th className="px-3 py-2 font-medium w-14">类型</th>
+                      <th className="px-3 py-2 font-medium w-14 text-right">舰船</th>
+                      <th className="px-3 py-2 font-medium w-20 text-right">军力</th>
+                      <th className="px-3 py-2 font-medium w-20 text-right">舰体</th>
+                      <th className="px-3 py-2 font-medium w-20">状态</th>
+                      <th className="px-3 py-2 font-medium w-28 text-right">坐标</th>
+                      <th className="px-3 py-2 font-medium w-12 text-right">ID</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredFleets.map((f) => (
+                      <tr key={f.id} className="border-t hover:bg-muted/50">
+                        <td className="px-3 py-1.5 max-w-[220px] truncate" title={f.name}>{f.name || `（舰队 ${f.id}）`}</td>
+                        <td className="px-3 py-1.5">
+                          {f.station ? (
+                            <Badge variant="secondary" className="text-[10px] px-1.5">空间站</Badge>
+                          ) : f.civilian ? (
+                            <Badge variant="outline" className="text-[10px] px-1.5">民用</Badge>
+                          ) : (
+                            <Badge variant="default" className="text-[10px] px-1.5">舰队</Badge>
+                          )}
+                        </td>
+                        <td className="px-3 py-1.5 text-right tabular-nums">{f.ship_count}</td>
+                        <td className="px-3 py-1.5 text-right tabular-nums">{f.military_power >= 1000 ? `${(f.military_power / 1000).toFixed(1)}k` : Math.round(f.military_power)}</td>
+                        <td className="px-3 py-1.5 text-right tabular-nums">{f.hit_points >= 1000 ? `${(f.hit_points / 1000).toFixed(0)}k` : Math.round(f.hit_points)}</td>
+                        <td className="px-3 py-1.5 text-muted-foreground" title={f.movement_state}>{f.movement_state.replace(/^move_/, '') || '—'}</td>
+                        <td className="px-3 py-1.5 text-right tabular-nums text-muted-foreground">
+                          {f.coordinate ? `(${Math.round(f.coordinate.x)}, ${Math.round(f.coordinate.y)})` : '—'}
+                        </td>
+                        <td className="px-3 py-1.5 text-right tabular-nums text-muted-foreground" title={`ownership: ${f.ownership_status}`}>{f.id}</td>
+                      </tr>
+                    ))}
+                    {filteredFleets.length === 0 && (
+                      <tr><td colSpan={8} className="px-3 py-6 text-center text-muted-foreground">无匹配舰队</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <p className="text-xs text-muted-foreground py-4 text-center">
+                {fleetsLoading ? '舰队列表加载中…' : fleetsError ? '加载失败' : '该国家暂无舰队数据'}
+              </p>
             )}
           </CardContent>
         </Card>
